@@ -144,6 +144,31 @@ open class MultiStreamViewModel : ViewModel() {
                     current.copy(isPtzControlVisible = action.visible)
                 }
             }
+
+            is MultiViewAction.SwitchToAdjacentChannel -> {
+                _uiState.update { current ->
+                    val total = current.channels.size
+                    if (total <= 1) return@update current
+
+                    val currentActiveIndex = if (current.isFullscreen && current.fullscreenChannelIndex >= 0) {
+                        current.fullscreenChannelIndex
+                    } else {
+                        current.selectedChannelIndex
+                    }
+
+                    val newIndex = if (action.isNext) {
+                        (currentActiveIndex + 1) % total
+                    } else {
+                        if (currentActiveIndex - 1 < 0) total - 1 else currentActiveIndex - 1
+                    }
+
+                    Log.d("MultiView", "SwitchToAdjacentChannel: isNext=${action.isNext}, from $currentActiveIndex to $newIndex")
+                    current.copy(
+                        selectedChannelIndex = newIndex,
+                        fullscreenChannelIndex = if (current.isFullscreen) newIndex else current.fullscreenChannelIndex
+                    )
+                }
+            }
         }
     }
 

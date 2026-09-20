@@ -18,7 +18,8 @@ object MultiViewLayoutManager {
     fun calculateSlots(
         mode: LayoutMode,
         streamCount: Int,
-        fullscreenChannelIndex: Int = -1
+        fullscreenChannelIndex: Int = -1,
+        selectedChannelIndex: Int = 0
     ): List<StreamSlotRect> {
         val effectiveMode = if (mode == LayoutMode.AUTO) {
             LayoutMode.getOptimalMode(streamCount)
@@ -28,10 +29,11 @@ object MultiViewLayoutManager {
 
         // 全屏模式处理
         if (effectiveMode == LayoutMode.FULLSCREEN || fullscreenChannelIndex >= 0) {
-            val targetIndex = if (fullscreenChannelIndex >= 0) fullscreenChannelIndex else 0
+            val targetIndex = if (fullscreenChannelIndex >= 0) fullscreenChannelIndex else selectedChannelIndex
+            val validIndex = if (streamCount > 0) targetIndex.coerceIn(0, streamCount - 1) else 0
             return listOf(
                 StreamSlotRect(
-                    slotIndex = targetIndex,
+                    slotIndex = validIndex,
                     normalizedLeft = 0.0f,
                     normalizedTop = 0.0f,
                     normalizedRight = 1.0f,
@@ -41,7 +43,18 @@ object MultiViewLayoutManager {
         }
 
         return when (effectiveMode) {
-            LayoutMode.GRID_1 -> generateUniformGrid(rows = 1, cols = 1)
+            LayoutMode.GRID_1 -> {
+                val validIndex = if (streamCount > 0) selectedChannelIndex.coerceIn(0, streamCount - 1) else 0
+                listOf(
+                    StreamSlotRect(
+                        slotIndex = validIndex,
+                        normalizedLeft = 0.0f,
+                        normalizedTop = 0.0f,
+                        normalizedRight = 1.0f,
+                        normalizedBottom = 1.0f
+                    )
+                )
+            }
             LayoutMode.GRID_4 -> generateUniformGrid(rows = 2, cols = 2)
             LayoutMode.GRID_9 -> generateUniformGrid(rows = 3, cols = 3)
             LayoutMode.GRID_16 -> generateUniformGrid(rows = 4, cols = 4)

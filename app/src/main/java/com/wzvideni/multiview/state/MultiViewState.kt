@@ -51,4 +51,7 @@ sealed interface MultiViewAction {
 
     /** 切换云台控制显隐 */
     data class TogglePtzControl(val visible: Boolean) : MultiViewAction
+
+    /** 左右滑动切换上一路/下一路单画面播放 (isNext=true 表示向左滑动切下一路，isNext=false 表示向右滑动切上一路) */
+    data class SwitchToAdjacentChannel(val isNext: Boolean) : MultiViewAction
 }

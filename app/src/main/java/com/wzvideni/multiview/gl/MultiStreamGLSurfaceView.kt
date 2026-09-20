@@ -39,9 +39,9 @@ class MultiStreamGLSurfaceView @JvmOverloads constructor(
     /**
      * 切换分屏布局
      */
-    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1) {
+    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1, selectedIndex: Int = 0) {
         queueEvent {
-            renderer.updateLayout(mode, count, fullscreenIndex)
+            renderer.updateLayout(mode, count, fullscreenIndex, selectedIndex)
         }
     }
 

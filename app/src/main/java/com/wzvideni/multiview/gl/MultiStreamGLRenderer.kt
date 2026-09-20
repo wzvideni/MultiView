@@ -222,11 +222,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     /**
      * 更新布局模式与流数量
      */
-    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1) {
+    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1, selectedIndex: Int = 0) {
         this.layoutMode = mode
         this.streamCount = count.coerceIn(1, MAX_CHANNELS)
         this.fullscreenChannelIndex = fullscreenIndex
-        this.currentSlots = MultiViewLayoutManager.calculateSlots(mode, streamCount, fullscreenIndex)
+        this.selectedChannelIndex = selectedIndex
+        this.currentSlots = MultiViewLayoutManager.calculateSlots(mode, streamCount, fullscreenIndex, selectedIndex)
     }
 
     /**
@@ -234,6 +235,9 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
      */
     fun setSelectedChannel(index: Int) {
         this.selectedChannelIndex = index
+        if (layoutMode == LayoutMode.GRID_1 || fullscreenChannelIndex >= 0) {
+            this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex, index)
+        }
     }
 
     /**
@@ -291,7 +295,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         this.surfaceWidth = width
         this.surfaceHeight = height
         GLES20.glViewport(0, 0, width, height)
-        this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex)
+        this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex, selectedChannelIndex)
     }
 
     override fun onDrawFrame(gl: GL10?) {

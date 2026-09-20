@@ -2,16 +2,21 @@ package com.wzvideni.multiview.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -23,6 +28,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -91,64 +97,101 @@ private fun TopStreamNavBar(
     onBackPressed: () -> Unit,
     onSelectCount: (Int) -> Unit
 ) {
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(Color(0xFF141A26))
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically
+            .padding(horizontal = 12.dp, vertical = 6.dp)
     ) {
-        IconButton(
-            onClick = onBackPressed,
-            modifier = Modifier.size(32.dp)
+        // 第一行：返回键、调度台标题与当前选中通道状态
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                contentDescription = "返回",
-                tint = Color.White
-            )
-        }
+            IconButton(
+                onClick = onBackPressed,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "返回",
+                    tint = Color.White
+                )
+            }
 
-        Spacer(modifier = Modifier.width(6.dp))
+            Spacer(modifier = Modifier.width(6.dp))
 
-        Column {
             Text(
                 text = "多路视频监控调度台",
                 color = Color.White,
-                fontSize = 14.sp,
+                fontSize = 15.sp,
                 fontWeight = FontWeight.Bold
             )
-            Text(
-                text = "当前点击: CAM ${String.format("%02d", selectedChannelIndex + 1)} ($selectedChannelName)",
-                color = Color(0xFF00E5FF),
-                fontSize = 10.sp
-            )
+
+            Spacer(modifier = Modifier.weight(1f))
+
+            val displayName = selectedChannelName.ifEmpty { "CAM ${String.format("%02d", selectedChannelIndex + 1)}" }
+            Box(
+                modifier = Modifier
+                    .background(Color(0x2600E5FF), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 8.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = displayName,
+                    color = Color(0xFF00E5FF),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
 
-        Spacer(modifier = Modifier.weight(1f))
+        Spacer(modifier = Modifier.height(6.dp))
 
-        Text(text = "流数:", color = Color.Gray, fontSize = 11.sp)
-        Spacer(modifier = Modifier.width(4.dp))
+        // 第二行：流数快速切换标签与各路数按钮
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "预设流数:",
+                color = Color(0xFFB0BEC5),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
 
-        // 快速切换路数 (4 / 9 / 16 / 25 / 32)
-        val countOptions = listOf(4, 9, 16, 25, 32)
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            countOptions.forEach { count ->
-                val isSelected = (currentCount == count)
-                Button(
-                    onClick = { onSelectCount(count) },
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isSelected) Color(0xFF00B0FF) else Color(0xFF222C3E)
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.size(width = 50.dp, height = 28.dp)
-                ) {
-                    Text(
-                        text = "${count}路",
-                        color = Color.White,
-                        fontSize = 9.sp,
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                    )
+            Spacer(modifier = Modifier.width(8.dp))
+
+            val countOptions = listOf(4, 9, 16, 25, 32)
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                countOptions.forEach { count ->
+                    val isSelected = (currentCount == count)
+                    Button(
+                        onClick = { onSelectCount(count) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isSelected) Color(0xFF00B0FF) else Color(0xFF222C3E)
+                        ),
+                        shape = RoundedCornerShape(6.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .defaultMinSize(minWidth = 1.dp, minHeight = 28.dp)
+                            .height(28.dp)
+                    ) {
+                        Text(
+                            text = "${count}路",
+                            color = Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
         }

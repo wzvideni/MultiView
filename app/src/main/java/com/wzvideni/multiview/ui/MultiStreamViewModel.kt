@@ -48,10 +48,19 @@ open class MultiStreamViewModel : ViewModel() {
             )
         }
 
+        val targetMode = when {
+            safeCount <= 1 -> LayoutMode.GRID_1
+            safeCount <= 4 -> LayoutMode.GRID_4
+            safeCount <= 9 -> LayoutMode.GRID_9
+            safeCount <= 16 -> LayoutMode.GRID_16
+            safeCount <= 25 -> LayoutMode.GRID_25
+            else -> LayoutMode.GRID_32
+        }
+
         _uiState.update { current ->
             current.copy(
                 channels = list,
-                layoutMode = if (count > 16) LayoutMode.GRID_32 else LayoutMode.GRID_16,
+                layoutMode = targetMode,
                 selectedChannelIndex = 0
             )
         }

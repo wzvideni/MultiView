@@ -5,8 +5,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -96,12 +98,16 @@ fun FullscreenControls(
                     containerColor = if (isMain) Color(0xFF00B0FF) else Color(0xFF37474F)
                 ),
                 shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.height(32.dp)
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .defaultMinSize(minWidth = 1.dp, minHeight = 32.dp)
+                    .height(32.dp)
             ) {
                 Text(
                     text = if (isMain) "高清 (主码流)" else "流畅 (辅码流)",
                     color = Color.White,
-                    fontSize = 11.sp
+                    fontSize = 12.sp,
+                    maxLines = 1
                 )
             }
 
@@ -114,12 +120,17 @@ fun FullscreenControls(
                     containerColor = if (isPtzVisible) Color(0xFF00E676) else Color(0xFF37474F)
                 ),
                 shape = RoundedCornerShape(16.dp),
-                modifier = Modifier.height(32.dp)
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .defaultMinSize(minWidth = 1.dp, minHeight = 32.dp)
+                    .height(32.dp)
             ) {
                 Text(
                     text = "云台",
-                    color = Color.White,
-                    fontSize = 11.sp
+                    color = if (isPtzVisible) Color.Black else Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = if (isPtzVisible) FontWeight.Bold else FontWeight.Normal,
+                    maxLines = 1
                 )
             }
         }
@@ -161,10 +172,16 @@ private fun ActionButton(title: String, onClick: () -> Unit) {
         modifier = Modifier
             .background(Color(0x33FFFFFF), RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 16.dp, vertical = 6.dp),
+            .padding(horizontal = 18.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(text = title, color = Color.White, fontSize = 12.sp)
+        Text(
+            text = title,
+            color = Color.White,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
     }
 }
 
@@ -202,9 +219,9 @@ private fun PtzControlPanel(
             Box(
                 modifier = Modifier
                     .size(36.dp)
-                    .background(Color(0xFF2C384E), CircleShape)
-                    .clickable { onDirectionClick("LEFT") },
-                contentAlignment = Alignment.Center
+                .background(Color(0xFF2C384E), CircleShape)
+                .clickable { onDirectionClick("LEFT") },
+            contentAlignment = Alignment.Center
             ) {
                 Text("◀", color = Color.White, fontSize = 14.sp)
             }
@@ -248,23 +265,31 @@ private fun PtzControlPanel(
         Spacer(modifier = Modifier.height(12.dp))
 
         // 变焦放大/缩小
-        Row {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Button(
                 onClick = { onZoomClick(true) },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C384E)),
                 shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.size(width = 56.dp, height = 28.dp)
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .defaultMinSize(minWidth = 52.dp, minHeight = 28.dp)
+                    .height(30.dp)
             ) {
-                Text("放大+", color = Color.White, fontSize = 10.sp)
+                Text("放大+", color = Color.White, fontSize = 11.sp, maxLines = 1)
             }
-            Spacer(modifier = Modifier.width(6.dp))
             Button(
                 onClick = { onZoomClick(false) },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C384E)),
                 shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.size(width = 56.dp, height = 28.dp)
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .defaultMinSize(minWidth = 52.dp, minHeight = 28.dp)
+                    .height(30.dp)
             ) {
-                Text("缩小-", color = Color.White, fontSize = 10.sp)
+                Text("缩小-", color = Color.White, fontSize = 11.sp, maxLines = 1)
             }
         }
     }

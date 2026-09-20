@@ -21,6 +21,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -144,19 +145,23 @@ fun MultiStreamOverlay(
                                 .background(statusColor, CircleShape)
                         )
 
-                        val channelTitle = channel?.name ?: "CAM ${String.format("%02d", channelIndex + 1)}"
+                        val shortTitle = if (widthDp < 65.dp) "${channelIndex + 1}" else "CAM ${String.format("%02d", channelIndex + 1)}"
+                        val channelTitle = if (widthDp < 110.dp) shortTitle else (channel?.name ?: shortTitle)
                         Text(
                             text = " $channelTitle",
                             color = Color.White,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold
+                            fontSize = if (widthDp < 65.dp) 9.sp else 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
 
-                        if (channel?.isMainStream == true) {
+                        if (channel?.isMainStream == true && widthDp >= 130.dp) {
                             Text(
                                 text = " [主码流]",
                                 color = Color(0xFF00E5FF),
-                                fontSize = 9.sp
+                                fontSize = 9.sp,
+                                maxLines = 1
                             )
                         }
                     }

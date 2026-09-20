@@ -14,11 +14,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.viewinterop.AndroidView
 import com.wzvideni.multiview.gl.IStreamFrameFeeder
 import com.wzvideni.multiview.gl.MultiStreamGLSurfaceView
 import com.wzvideni.multiview.layout.MultiViewLayoutManager
+import com.wzvideni.multiview.player.RtspStreamPlayerManager
 import com.wzvideni.multiview.state.MultiViewAction
 import com.wzvideni.multiview.state.MultiViewState
 
@@ -39,6 +41,8 @@ fun MultiStreamPlayerView(
     onFrameFeederReady: ((IStreamFrameFeeder) -> Unit)? = null,
     showControls: Boolean = true
 ) {
+    val context = LocalContext.current
+    val playerManager = remember { RtspStreamPlayerManager(context) }
     var surfaceViewRef by remember { mutableStateOf<MultiStreamGLSurfaceView?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
@@ -65,6 +69,17 @@ fun MultiStreamPlayerView(
         surfaceViewRef?.setSelectedChannel(state.selectedChannelIndex)
     }
 
+    // 动态智能调度 RTSP 播放器拉流
+    LaunchedEffect(state.channels, currentSlots, state.isFullscreen, state.fullscreenChannelIndex) {
+        val visibleIndices = currentSlots.map { it.slotIndex }
+        playerManager.updateStreams(
+            channels = state.channels,
+            visibleIndices = visibleIndices,
+            isFullscreen = state.isFullscreen,
+            fullscreenChannelIndex = state.fullscreenChannelIndex
+        )
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -73,9 +88,10 @@ fun MultiStreamPlayerView(
     ) {
         // 1. 底层：单一 OpenGL ES SurfaceView 负责所有 1~32 路视频画面的视口合成绘制
         AndroidView(
-            factory = { context ->
-                MultiStreamGLSurfaceView(context).also { view ->
+            factory = { ctx ->
+                MultiStreamGLSurfaceView(ctx).also { view ->
                     surfaceViewRef = view
+                    playerManager.bindFeeder(view.renderer)
                     onFrameFeederReady?.invoke(view.renderer)
                 }
             },
@@ -87,6 +103,7 @@ fun MultiStreamPlayerView(
 
         DisposableEffect(Unit) {
             onDispose {
+                playerManager.releaseAll()
                 surfaceViewRef?.onDestroy()
                 surfaceViewRef = null
             }

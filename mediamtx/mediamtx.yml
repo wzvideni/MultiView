@@ -877,20 +877,20 @@ pathDefaults:
 # for example "~^(test1|test2)$" will match both "test1" and "test2",
 # for example "~^prefix" will match all paths that start with "prefix".
 paths:
-  # 辅码流（子码流）：匹配 live/sub01 ~ live/sub32，按需生成 640x360 15fps 模拟监控流
+  # 辅码流（子码流）：匹配 live/sub01 ~ live/sub32，按需生成 640x360 15fps 模拟监控流 (1秒关键帧间隔实现秒开)
   "~^live/sub([0-9]+)$":
-    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 15 -keyint_min 15 -sc_threshold 0 -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
     runOnDemandCloseAfter: 3s
 
-  # 主码流：匹配 live/main01 ~ live/main32，按需生成 1920x1080 25fps 高清流
+  # 主码流：匹配 live/main01 ~ live/main32，按需生成 1920x1080 25fps 高清流 (1秒关键帧间隔)
   "~^live/main([0-9]+)$":
-    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=1920x1080:rate=25 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v 2048k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=1920x1080:rate=25 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 25 -keyint_min 25 -sc_threshold 0 -b:v 2048k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
     runOnDemandCloseAfter: 3s
 
   # 兜底：其他任何未显式指定的路径
   all_others:
-    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
+    runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 15 -keyint_min 15 -sc_threshold 0 -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
     runOnDemandCloseAfter: 3s

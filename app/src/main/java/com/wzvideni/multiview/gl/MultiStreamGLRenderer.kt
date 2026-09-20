@@ -5,11 +5,15 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
+import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.opengl.Matrix
 import android.os.SystemClock
-import com.wzvideni.multiview.gl.GLShaderHelper
+import android.util.Log
+import android.view.Surface
 import com.wzvideni.multiview.layout.MultiViewLayoutManager
 import com.wzvideni.multiview.layout.StreamSlotRect
 import com.wzvideni.multiview.model.LayoutMode
@@ -18,20 +22,23 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
 /**
  * 核心 OpenGL ES 多画面合成渲染器（支持 1 ~ 32 路画面）
  *
- * 采用单 SurfaceView + 动态 Viewport 视口复用技术：
+ * 采用单 SurfaceView + 动态 Viewport 视口复用 + SurfaceTexture 零拷贝硬件加速技术：
  * 1. 杜绝创建 16~32 个 View/TextureView 的显存消耗与系统图层合成压力；
- * 2. 保证各通道独立渲染与超低时延；
- * 3. 完美支持单路全屏无缝切换与命中测试联动。
+ * 2. 支持 ExoPlayer / MediaCodec 硬件解码直接输出到 SurfaceTexture (GL_TEXTURE_EXTERNAL_OES)；
+ * 3. 保证各通道独立渲染与超低时延，同时支持未接入真实流通道的科技感模拟画面；
+ * 4. 完美支持单路全屏无缝切换与命中测试联动。
  */
 class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
     companion object {
+        private const val TAG = "MultiStreamGLRenderer"
         const val MAX_CHANNELS = 32
 
         private val VERTICES = floatArrayOf(
@@ -48,6 +55,13 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             1.0f, 0.0f  // 对应右上
         )
 
+        private val OES_TEX_COORDS = floatArrayOf(
+            0.0f, 1.0f, // 对应左上 (符合 SurfaceTexture.getTransformMatrix 标准)
+            0.0f, 0.0f, // 对应左下
+            1.0f, 0.0f, // 对应右下
+            1.0f, 1.0f  // 对应右上
+        )
+
         private val INDICES = shortArrayOf(0, 1, 2, 0, 2, 3)
 
         private const val VERTEX_SHADER_CODE = """
@@ -57,6 +71,27 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             void main() {
                 gl_Position = aPosition;
                 vTexCoord = aTexCoord;
+            }
+        """
+
+        private const val OES_VERTEX_SHADER_CODE = """
+            attribute vec4 aPosition;
+            attribute vec2 aTexCoord;
+            uniform mat4 uTexMatrix;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
+            }
+        """
+
+        private const val OES_FRAGMENT_SHADER_CODE = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            varying vec2 vTexCoord;
+            uniform samplerExternalOES uTexture;
+            void main() {
+                gl_FragColor = texture2D(uTexture, vTexCoord);
             }
         """
 
@@ -109,6 +144,14 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             position(0)
         }
 
+    private val oesTexCoordBuffer: FloatBuffer = ByteBuffer.allocateDirect(OES_TEX_COORDS.size * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(OES_TEX_COORDS)
+            position(0)
+        }
+
     private val indexBuffer: ShortBuffer = ByteBuffer.allocateDirect(INDICES.size * 2)
         .order(ByteOrder.nativeOrder())
         .asShortBuffer()
@@ -117,11 +160,23 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             position(0)
         }
 
-    // GL 状态
+    // GL 着色器程序
     private var textureProgram = 0
     private var proceduralProgram = 0
+    private var oesProgram = 0
+
+    // 传统 2D 纹理（用于 feedRgbaFrame 离线帧）
     private val textureIds = IntArray(MAX_CHANNELS)
     private val hasRealFrame = BooleanArray(MAX_CHANNELS) { false }
+
+    // OES 外部纹理与 SurfaceTexture（用于硬件解码直接输出）
+    private val oesTextureIds = IntArray(MAX_CHANNELS)
+    private val surfaceTextures = arrayOfNulls<SurfaceTexture>(MAX_CHANNELS)
+    private val surfaces = arrayOfNulls<Surface>(MAX_CHANNELS)
+    private val hasOesFrame = BooleanArray(MAX_CHANNELS) { false }
+    private val frameAvailableFlags = Array(MAX_CHANNELS) { AtomicBoolean(false) }
+    private val texMatrices = Array(MAX_CHANNELS) { FloatArray(16) }
+    private var onSurfaceAvailableListener: ((channelIndex: Int, surface: Surface) -> Unit)? = null
 
     @Volatile
     private var surfaceWidth = 1920
@@ -191,8 +246,9 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
         textureProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, TEXTURE_FRAGMENT_SHADER_CODE)
         proceduralProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, PROCEDURAL_FRAGMENT_SHADER_CODE)
+        oesProgram = GLShaderHelper.createProgram(OES_VERTEX_SHADER_CODE, OES_FRAGMENT_SHADER_CODE)
 
-        // 初始化 32 个纹理
+        // 1. 初始化 32 个传统 2D 纹理
         GLES20.glGenTextures(MAX_CHANNELS, textureIds, 0)
         for (i in 0 until MAX_CHANNELS) {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureIds[i])
@@ -201,35 +257,87 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-            // 为每个通道初始化一张默认文字占位图（显示通道序号与等待提示）
-            val bitmap = createPlaceholderBitmap(i)
-            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
-            bitmap.recycle()
+            val placeholder = createPlaceholderBitmap(i)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, placeholder, 0)
+            placeholder.recycle()
         }
 
-        updateLayout(layoutMode, streamCount, fullscreenChannelIndex)
+        // 2. 初始化 32 个硬件加速 OES 外部纹理及关联的 SurfaceTexture / Surface
+        GLES20.glGenTextures(MAX_CHANNELS, oesTextureIds, 0)
+        for (i in 0 until MAX_CHANNELS) {
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureIds[i])
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+            Matrix.setIdentityM(texMatrices[i], 0)
+
+            val channelIndex = i
+            val st = SurfaceTexture(oesTextureIds[i])
+            st.setOnFrameAvailableListener {
+                frameAvailableFlags[channelIndex].set(true)
+            }
+            surfaceTextures[i] = st
+            val surf = Surface(st)
+            surfaces[i] = surf
+
+            // 通知外部监听者（如 ExoPlayer 管理器）该通道 Surface 已可用
+            onSurfaceAvailableListener?.invoke(channelIndex, surf)
+        }
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         this.surfaceWidth = width
         this.surfaceHeight = height
-        updateLayout(layoutMode, streamCount, fullscreenChannelIndex)
+        GLES20.glViewport(0, 0, width, height)
+        this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex)
     }
 
     override fun onDrawFrame(gl: GL10?) {
-        // 清屏（全局背景深蓝黑色）
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        // 清理背景
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
-        val currentTimeSec = (SystemClock.uptimeMillis() - startTime) / 1000f
-
-        // 上传等待中的视频帧到 GL 纹理
+        // 上传所有待渲染的像素帧（RGB 内存缓冲方式）
         uploadPendingFrames()
 
+        val currentTimeSec = (SystemClock.uptimeMillis() - startTime) / 1000.0f
         val slots = currentSlots
-        if (slots.isEmpty()) return
 
-        // 全屏模式处理
-        if (fullscreenChannelIndex in 0 until MAX_CHANNELS) {
+        // 更新有新视频帧可用的 SurfaceTexture 硬件纹理
+        for (slot in slots) {
+            val channelIdx = slot.slotIndex
+            if (channelIdx in 0 until MAX_CHANNELS) {
+                if (frameAvailableFlags[channelIdx].getAndSet(false)) {
+                    val st = surfaceTextures[channelIdx]
+                    if (st != null) {
+                        try {
+                            st.updateTexImage()
+                            st.getTransformMatrix(texMatrices[channelIdx])
+                            hasOesFrame[channelIdx] = true
+                        } catch (e: Exception) {
+                            Log.w(TAG, "updateTexImage failed for ch $channelIdx: ${e.message}")
+                        }
+                    }
+                }
+            }
+        }
+
+        // 单路全屏模式优先处理
+        if (fullscreenChannelIndex >= 0) {
+            if (frameAvailableFlags[fullscreenChannelIndex].getAndSet(false)) {
+                val st = surfaceTextures[fullscreenChannelIndex]
+                if (st != null) {
+                    try {
+                        st.updateTexImage()
+                        st.getTransformMatrix(texMatrices[fullscreenChannelIndex])
+                        hasOesFrame[fullscreenChannelIndex] = true
+                    } catch (e: Exception) {
+                        Log.w(TAG, "updateTexImage fullscreen failed: ${e.message}")
+                    }
+                }
+            }
+
             drawChannel(
                 channelIndex = fullscreenChannelIndex,
                 glX = 0,
@@ -264,10 +372,36 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         GLES20.glScissor(glX, glY, glW, glH)
         GLES20.glViewport(glX, glY, glW, glH)
 
-        val hasFrame = hasRealFrame[channelIndex]
+        val isOesActive = hasOesFrame[channelIndex]
+        val isRgbaActive = hasRealFrame[channelIndex]
 
-        if (hasFrame || !isTestPatternEnabled) {
-            // 使用纹理渲染真实流画面（或默认卡片）
+        if (isOesActive) {
+            // 方案 A：使用 OES 外部纹理渲染硬件解码视频（ExoPlayer / MediaCodec 零拷贝）
+            GLES20.glUseProgram(oesProgram)
+
+            val aPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
+            val aTexCoord = GLES20.glGetAttribLocation(oesProgram, "aTexCoord")
+            val uTexMatrix = GLES20.glGetUniformLocation(oesProgram, "uTexMatrix")
+            val uTexture = GLES20.glGetUniformLocation(oesProgram, "uTexture")
+
+            GLES20.glEnableVertexAttribArray(aPosition)
+            GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+
+            GLES20.glEnableVertexAttribArray(aTexCoord)
+            GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 0, oesTexCoordBuffer)
+
+            GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrices[channelIndex], 0)
+
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureIds[channelIndex])
+            GLES20.glUniform1i(uTexture, 0)
+
+            GLES20.glDrawElements(GLES20.GL_TRIANGLES, INDICES.size, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
+
+            GLES20.glDisableVertexAttribArray(aPosition)
+            GLES20.glDisableVertexAttribArray(aTexCoord)
+        } else if (isRgbaActive || !isTestPatternEnabled) {
+            // 方案 B：使用 2D 纹理渲染软解/投递画面
             GLES20.glUseProgram(textureProgram)
 
             val aPosition = GLES20.glGetAttribLocation(textureProgram, "aPosition")
@@ -289,7 +423,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             GLES20.glDisableVertexAttribArray(aPosition)
             GLES20.glDisableVertexAttribArray(aTexCoord)
         } else {
-            // 使用动态扫描着色器渲染演示模拟流（超低开销，呈现科技感动态画面）
+            // 方案 C：使用动态扫描着色器渲染科技感模拟监控背景
             GLES20.glUseProgram(proceduralProgram)
 
             val aPosition = GLES20.glGetAttribLocation(proceduralProgram, "aPosition")
@@ -349,33 +483,52 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(40, 50, 65)
             style = Paint.Style.STROKE
-            strokeWidth = 4f
+            strokeWidth = 2f
         }
-        canvas.drawRect(Rect(0, 0, width, height), paint)
 
-        // 绘制通道文字与图标示意
+        // 网格线
+        for (x in 0..width step 40) {
+            canvas.drawLine(x.toFloat(), 0f, x.toFloat(), height.toFloat(), paint)
+        }
+        for (y in 0..height step 40) {
+            canvas.drawLine(0f, y.toFloat(), width.toFloat(), y.toFloat(), paint)
+        }
+
+        // 居中通道编号
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(120, 160, 200)
+            color = Color.rgb(0, 229, 255)
             textSize = 28f
             textAlign = Paint.Align.CENTER
-            isFakeBoldText = true
         }
         val channelNum = String.format("%02d", channelIndex + 1)
-        canvas.drawText("CAM $channelNum", width / 2f, height / 2f - 8f, textPaint)
-
-        val subPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(80, 100, 120)
-            textSize = 18f
-            textAlign = Paint.Align.CENTER
-        }
-        canvas.drawText("等待推流 (RTSP)", width / 2f, height / 2f + 24f, subPaint)
+        val bounds = Rect()
+        textPaint.getTextBounds("CAM $channelNum", 0, 6, bounds)
+        canvas.drawText("CAM $channelNum", width / 2f, height / 2f + bounds.height() / 2f, textPaint)
 
         return bitmap
     }
 
     // --- IStreamFrameFeeder 接口实现 ---
 
-    override fun feedRgbaFrame(channelIndex: Int, width: Int, height: Int, rgbaBuffer: ByteBuffer) {
+    override fun getChannelSurface(channelIndex: Int): Surface? {
+        return if (channelIndex in 0 until MAX_CHANNELS) surfaces[channelIndex] else null
+    }
+
+    override fun setOnSurfaceAvailableListener(listener: ((channelIndex: Int, surface: Surface) -> Unit)?) {
+        this.onSurfaceAvailableListener = listener
+        if (listener != null) {
+            for (i in 0 until MAX_CHANNELS) {
+                surfaces[i]?.let { listener.invoke(i, it) }
+            }
+        }
+    }
+
+    override fun feedRgbaFrame(
+        channelIndex: Int,
+        width: Int,
+        height: Int,
+        rgbaBuffer: ByteBuffer
+    ) {
         if (channelIndex in 0 until MAX_CHANNELS) {
             frameQueue[channelIndex] = PendingFrame(width, height, rgbaBuffer)
         }
@@ -399,6 +552,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     override fun clearChannel(channelIndex: Int) {
         if (channelIndex in 0 until MAX_CHANNELS) {
             hasRealFrame[channelIndex] = false
+            hasOesFrame[channelIndex] = false
             frameQueue.remove(channelIndex)
         }
     }
@@ -412,6 +566,18 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             GLES20.glDeleteProgram(proceduralProgram)
             proceduralProgram = 0
         }
+        if (oesProgram != 0) {
+            GLES20.glDeleteProgram(oesProgram)
+            oesProgram = 0
+        }
         GLES20.glDeleteTextures(MAX_CHANNELS, textureIds, 0)
+        GLES20.glDeleteTextures(MAX_CHANNELS, oesTextureIds, 0)
+
+        for (i in 0 until MAX_CHANNELS) {
+            surfaces[i]?.release()
+            surfaces[i] = null
+            surfaceTextures[i]?.release()
+            surfaceTextures[i] = null
+        }
     }
 }

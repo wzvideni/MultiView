@@ -1,11 +1,22 @@
 package com.wzvideni.multiview.gl
 
+import android.view.Surface
 import java.nio.ByteBuffer
 
 /**
- * 视频流解码帧投递接口（用于对接 FFmpeg / NDK / MediaCodec 解码器）
+ * 视频流解码帧投递接口（用于对接 FFmpeg / NDK / MediaCodec / ExoPlayer 解码器）
  */
 interface IStreamFrameFeeder {
+
+    /**
+     * 获取指定通道绑定的硬件解码 Surface（可直接对接 ExoPlayer / MediaCodec 进行零拷贝硬件解码渲染）
+     */
+    fun getChannelSurface(channelIndex: Int): Surface?
+
+    /**
+     * 注册通道 Surface 就绪监听
+     */
+    fun setOnSurfaceAvailableListener(listener: ((channelIndex: Int, surface: Surface) -> Unit)?)
 
     /**
      * 投递 RGBA 格式的一帧视频画面

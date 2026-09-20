@@ -1,10 +1,44 @@
 @echo off
 title MediaMTX RTSP Server
-echo ====================================================================
-echo  MediaMTX RTSP 1~32 è·¯å¤šè·¯ç›‘æ§æ¨¡æ‹Ÿæ¨æµæœåŠ¡
-echo  å±€åŸŸç½‘ RTSP åŸºç¡€åœ°å€: rtsp://192.168.31.49:8554/live/
-echo    - è¾…ç æµ(å­ç æµ 360P 15fps): rtsp://192.168.31.49:8554/live/sub01 ~ sub32
-echo    - ä¸»ç æµ(é«˜æ¸… 1080P 25fps): rtsp://192.168.31.49:8554/live/main01 ~ main32
-echo ====================================================================
-C:\Programs\mediamtx\mediamtx.exe C:\Programs\mediamtx\mediamtx.yml
-pause
+cd /d "%~dp0"
+
+for /f "tokens=4" %%a in ('route print ^| findstr 0.0.0.0.*0.0.0.0') do (
+    set LOCAL_IP=%%a
+)
+if "%LOCAL_IP%"=="" set LOCAL_IP=127.0.0.1
+
+echo ==============================================================================
+echo                 MediaMTX RTSP 1-32 Â·¶àÂ·¼à¿ØÄ£ÄâÍÆÁ÷·şÎñ
+echo ==============================================================================
+echo  ±¾»ú¾ÖÓòÍø IP: %LOCAL_IP%
+echo  RTSP ·şÎñ¶Ë¿Ú: 8554 (TCP/UDP)
+echo.
+echo  [Á÷µØÖ·ÁĞ±í]:
+echo    - ¸¨ÂëÁ÷ [Á÷³©Ô¤ÀÀ 640x360@15fps, 1Ãë¹Ø¼üÖ¡Ãë¿ª]:
+echo      rtsp://%LOCAL_IP%:8554/live/sub01  ~  rtsp://%LOCAL_IP%:8554/live/sub32
+echo.
+echo    - Ö÷ÂëÁ÷ [¸ßÇåÈ«ÆÁ 1920x1080@25fps, 1Ãë¹Ø¼üÖ¡]:
+echo      rtsp://%LOCAL_IP%:8554/live/main01 ~  rtsp://%LOCAL_IP%:8554/live/main32
+echo.
+echo  [¹¤×÷»úÖÆ]:
+echo    - °´ĞèÀ­Á÷ On-Demand: ¿Í»§¶ËÁ¬½ÓÊ±×Ô¶¯´¥·¢ÍÆÁ÷£¬¶Ï¿ª3Ãëºó×Ô¶¯¹Ø±ÕÒÔ½ÚÊ¡×ÊÔ´
+echo ==============================================================================
+echo.
+
+if not exist "C:\Programs\ffmpeg\bin\ffmpeg.exe" (
+    echo [¾¯¸æ] Î´¼ì²âµ½ C:\Programs\ffmpeg\bin\ffmpeg.exe
+    echo ÇëÈ·ÈÏ FFmpeg °²×°Â·¾¶ÊÇ·ñÕıÈ·£¬·ñÔòÄ£ÄâÊÓÆµÁ÷½«ÎŞ·¨×Ô¶¯Éú³É¡£
+    echo.
+)
+
+echo ÕıÔÚÆô¶¯ MediaMTX ·şÎñ...
+echo ÌáÊ¾: °´ Ctrl+C ¿ÉÍ£Ö¹·şÎñ
+echo.
+
+mediamtx.exe mediamtx.yml
+
+if %errorlevel% neq 0 (
+    echo.
+    echo [´íÎó] MediaMTX Òì³£ÍË³ö£¬´íÎó´úÂë: %errorlevel%
+    pause
+)

@@ -17,6 +17,10 @@ import kotlinx.coroutines.flow.update
  */
 open class MultiStreamViewModel : ViewModel() {
 
+    companion object {
+        const val DEFAULT_RTSP_HOST = "192.168.31.49:8554"
+    }
+
     private val _uiState = MutableStateFlow(MultiViewState())
     val uiState: StateFlow<MultiViewState> = _uiState.asStateFlow()
 
@@ -32,13 +36,15 @@ open class MultiStreamViewModel : ViewModel() {
         val safeCount = count.coerceIn(1, 32)
         val list = (0 until safeCount).map { index ->
             val channelNum = String.format("%02d", index + 1)
+            val subUrl = "rtsp://$DEFAULT_RTSP_HOST/live/sub$channelNum"
+            val mainUrl = "rtsp://$DEFAULT_RTSP_HOST/live/main$channelNum"
             StreamChannel(
                 id = "stream_$channelNum",
                 channelIndex = index,
                 name = "CAM $channelNum ${getChannelLocationName(index)}",
-                rtspUrl = "rtsp://192.168.1.100:554/live/sub$channelNum",
-                subRtspUrl = "rtsp://192.168.1.100:554/live/sub$channelNum",
-                mainRtspUrl = "rtsp://192.168.1.100:554/live/main$channelNum",
+                rtspUrl = subUrl,
+                subRtspUrl = subUrl,
+                mainRtspUrl = mainUrl,
                 isMainStream = false,
                 status = StreamStatus.PLAYING,
                 resolution = "640x360",
@@ -112,6 +118,7 @@ open class MultiStreamViewModel : ViewModel() {
                         if (i == idx) {
                             ch.copy(
                                 isMainStream = action.useMainStream,
+                                rtspUrl = if (action.useMainStream) ch.mainRtspUrl else ch.subRtspUrl,
                                 resolution = if (action.useMainStream) "1920x1080" else "640x360",
                                 bitrateKbps = if (action.useMainStream) 2048 else 512,
                                 fps = if (action.useMainStream) 25 else 15

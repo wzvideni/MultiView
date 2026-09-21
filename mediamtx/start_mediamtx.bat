@@ -1,44 +1,76 @@
 @echo off
+chcp 65001 >nul
 title MediaMTX RTSP Server
 cd /d "%~dp0"
 
-for /f "tokens=4" %%a in ('route print ^| findstr 0.0.0.0.*0.0.0.0') do (
-    set LOCAL_IP=%%a
+set "LOCAL_IP="
+for /f "tokens=4" %%a in ('route print ^| findstr "0.0.0.0.*0.0.0.0"') do (
+    set "LOCAL_IP=%%a"
 )
-if "%LOCAL_IP%"=="" set LOCAL_IP=127.0.0.1
+if "%LOCAL_IP%"=="" set "LOCAL_IP=127.0.0.1"
 
 echo ==============================================================================
-echo                 MediaMTX RTSP 1-32 Â·¶àÂ·¼à¿ØÄ£ÄâÍÆÁ÷·şÎñ
+echo                 MediaMTX RTSP 1-32 è·¯å¤šè·¯ç›‘æ§æ¨¡æ‹Ÿæ¨æµæœåŠ¡
 echo ==============================================================================
-echo  ±¾»ú¾ÖÓòÍø IP: %LOCAL_IP%
-echo  RTSP ·şÎñ¶Ë¿Ú: 8554 (TCP/UDP)
+echo  [ç½‘ç»œä¿¡æ¯]
+echo    æœ¬æœºå±€åŸŸç½‘ IP: %LOCAL_IP%
+echo    RTSP ç«¯å£: 8554 (TCP/UDP)
 echo.
-echo  [Á÷µØÖ·ÁĞ±í]:
-echo    - ¸¨ÂëÁ÷ [Á÷³©Ô¤ÀÀ 640x360@15fps, 1Ãë¹Ø¼üÖ¡Ãë¿ª]:
+echo  [æ’­æ”¾åœ°å€åˆ—è¡¨]:
+echo    - è¾…ç æµ [é¢„è§ˆ 640x360@15fps, 1å…³é”®å¸§/ç§’]:
 echo      rtsp://%LOCAL_IP%:8554/live/sub01  ~  rtsp://%LOCAL_IP%:8554/live/sub32
 echo.
-echo    - Ö÷ÂëÁ÷ [¸ßÇåÈ«ÆÁ 1920x1080@25fps, 1Ãë¹Ø¼üÖ¡]:
+echo    - ä¸»ç æµ [å…¨é«˜æ¸… 1920x1080@25fps, 1å…³é”®å¸§/ç§’]:
 echo      rtsp://%LOCAL_IP%:8554/live/main01 ~  rtsp://%LOCAL_IP%:8554/live/main32
 echo.
-echo  [¹¤×÷»úÖÆ]:
-echo    - °´ĞèÀ­Á÷ On-Demand: ¿Í»§¶ËÁ¬½ÓÊ±×Ô¶¯´¥·¢ÍÆÁ÷£¬¶Ï¿ª3Ãëºó×Ô¶¯¹Ø±ÕÒÔ½ÚÊ¡×ÊÔ´
+echo    - USB è°ƒè¯•ç›´è¿ (Android æ‰‹æœºè¿æ¥ USB æ—¶):
+echo      rtsp://127.0.0.1:8554/live/sub01  ~  rtsp://127.0.0.1:8554/live/sub32
 echo ==============================================================================
 echo.
 
-if not exist "C:\Programs\ffmpeg\bin\ffmpeg.exe" (
-    echo [¾¯¸æ] Î´¼ì²âµ½ C:\Programs\ffmpeg\bin\ffmpeg.exe
-    echo ÇëÈ·ÈÏ FFmpeg °²×°Â·¾¶ÊÇ·ñÕıÈ·£¬·ñÔòÄ£ÄâÊÓÆµÁ÷½«ÎŞ·¨×Ô¶¯Éú³É¡£
+where ffmpeg >nul 2>nul
+if %errorlevel% neq 0 (
+    if not exist "C:\Programs\ffmpeg\bin\ffmpeg.exe" (
+        echo [è­¦å‘Š] æœªæ£€æµ‹åˆ° ffmpegï¼Œè¯·ç¡®ä¿å·²å®‰è£… FFmpeg å¹¶é…ç½®ç¯å¢ƒå˜é‡æˆ–å®‰è£…åœ¨ C:\Programs\ffmpeg\bin\
+        echo.
+    )
+)
+
+where adb >nul 2>nul
+if %errorlevel% equ 0 (
+    echo [ADB ç«¯å£åå‘ä»£ç†] æ­£åœ¨æ£€æŸ¥å¹¶é…ç½®å·²è¿æ¥çš„ Android è®¾å¤‡...
+    for /f "tokens=1" %%d in ('adb devices ^| findstr /r /c:"[a-zA-Z0-9].*device$"') do (
+        adb -s %%d reverse tcp:8554 tcp:8554 >nul 2>&1
+        echo    - è®¾å¤‡ %%d: åå‘ä»£ç†å°±ç»ª [æ‰‹æœº 127.0.0.1:8554 -^> ç”µè„‘ 8554]
+    )
+    start "" /b powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0adb_reverse_daemon.ps1"
+    echo [ADB æœåŠ¡] åå°è‡ªåŠ¨å®ˆæŠ¤è¿›ç¨‹å·²å°±ç»ªã€‚
     echo.
 )
 
-echo ÕıÔÚÆô¶¯ MediaMTX ·şÎñ...
-echo ÌáÊ¾: °´ Ctrl+C ¿ÉÍ£Ö¹·şÎñ
+set "MEDIAMTX_CMD=mediamtx"
+where mediamtx >nul 2>nul
+if %errorlevel% neq 0 (
+    if exist "mediamtx.exe" (
+        set "MEDIAMTX_CMD=.\mediamtx.exe"
+    ) else if exist "C:\Programs\mediamtx\mediamtx.exe" (
+        set "MEDIAMTX_CMD=C:\Programs\mediamtx\mediamtx.exe"
+    ) else (
+        echo [é”™è¯¯] æœªæ‰¾åˆ° mediamtx å¯æ‰§è¡Œæ–‡ä»¶ï¼
+        echo è¯·ç¡®ä¿å·²å®‰è£… MediaMTX å¹¶å°†å…¶æ·»åŠ åˆ° PATHï¼Œæˆ–æ”¾å…¥ C:\Programs\mediamtx\ æˆ–å½“å‰ç›®å½•ã€‚
+        pause
+        exit /b 1
+    )
+)
+
+echo æ­£åœ¨å¯åŠ¨ MediaMTX æœåŠ¡...
+echo æç¤º: æŒ‰ Ctrl+C å¯åœæ­¢æœåŠ¡
 echo.
 
-mediamtx.exe mediamtx.yml
+%MEDIAMTX_CMD% mediamtx.yml
 
 if %errorlevel% neq 0 (
     echo.
-    echo [´íÎó] MediaMTX Òì³£ÍË³ö£¬´íÎó´úÂë: %errorlevel%
+    echo [é”™è¯¯] MediaMTX å¼‚å¸¸é€€å‡ºï¼Œé€€å‡ºç : %errorlevel%
     pause
 )

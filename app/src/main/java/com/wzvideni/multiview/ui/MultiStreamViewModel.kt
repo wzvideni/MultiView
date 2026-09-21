@@ -18,7 +18,14 @@ import kotlinx.coroutines.flow.update
 open class MultiStreamViewModel : ViewModel() {
 
     companion object {
-        const val DEFAULT_RTSP_HOST = "192.168.31.49:8554"
+        /**
+         * 本地 RTSP 服务器地址配置：
+         * 1. USB 调试连接（推荐）：启动 mediamtx 脚本会自动执行 `adb reverse tcp:8554 tcp:8554`，
+         *    手机端直接使用 "127.0.0.1:8554" 直连 PC，不受 WiFi 子网隔离影响。
+         * 2. 同一局域网 WiFi：若手机和 PC 在同一 WiFi 下，可配置为电脑局域网 IP（如 "192.168.0.25:8554"）。
+         * 3. 官方模拟器：可使用 "10.0.2.2:8554"。
+         */
+        const val DEFAULT_RTSP_HOST = "127.0.0.1:8554"
     }
 
     private val _uiState = MutableStateFlow(MultiViewState())

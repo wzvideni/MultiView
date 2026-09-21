@@ -29,8 +29,8 @@ class RtspStreamPlayerManager(private val context: Context) {
 
     companion object {
         private const val TAG = "RtspPlayerManager"
-        // 针对低端机型（如骁龙 400 系列），限制后台同时并发解码的硬件播放器上限（防 MediaCodec 资源耗尽）
-        private const val MAX_CONCURRENT_PLAYERS = 4
+        // 限制后台同时并发解码的硬件播放器上限（防 MediaCodec 资源耗尽）
+        private const val MAX_CONCURRENT_PLAYERS = 16
     }
 
     private val mainHandler = Handler(Looper.getMainLooper())

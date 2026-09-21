@@ -881,16 +881,16 @@ paths:
   "~^live/sub([0-9]+)$":
     runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 15 -keyint_min 15 -sc_threshold 0 -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
-    runOnDemandCloseAfter: 3s
+    runOnDemandCloseAfter: 60s
 
   # 主码流：匹配 live/main01 ~ live/main32，按需生成 1920x1080 25fps 高清流 (1秒关键帧间隔)
   "~^live/main([0-9]+)$":
     runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=1920x1080:rate=25 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 25 -keyint_min 25 -sc_threshold 0 -b:v 2048k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
-    runOnDemandCloseAfter: 3s
+    runOnDemandCloseAfter: 60s
 
-  # 兜底：其他任何未显式指定的路径
+  # 兜底：其他任何未显式指定路径的请求
   all_others:
     runOnDemand: C:/Programs/ffmpeg/bin/ffmpeg.exe -re -f lavfi -i testsrc=size=640x360:rate=15 -vcodec libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 15 -keyint_min 15 -sc_threshold 0 -b:v 512k -f rtsp rtsp://localhost:$RTSP_PORT/$MTX_PATH
     runOnDemandRestart: yes
-    runOnDemandCloseAfter: 3s
+    runOnDemandCloseAfter: 60s

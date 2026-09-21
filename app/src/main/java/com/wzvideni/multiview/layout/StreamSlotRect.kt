@@ -7,13 +7,17 @@ import android.graphics.RectF
  */
 data class StreamSlotRect(
     val slotIndex: Int,
+    val channelIndex: Int = slotIndex,
     val normalizedLeft: Float,
     val normalizedTop: Float,
     val normalizedRight: Float,
-    val normalizedBottom: Float
+    val normalizedBottom: Float,
+    val isEmptySlot: Boolean = false
 ) {
-    val normalizedWidth: Float get() = normalizedRight - normalizedLeft
-    val normalizedHeight: Float get() = normalizedBottom - normalizedTop
+    val width: Float get() = normalizedRight - normalizedLeft
+    val height: Float get() = normalizedBottom - normalizedTop
+    val normalizedWidth: Float get() = width
+    val normalizedHeight: Float get() = height
 
     /**
      * 判断归一化点是否在此槽位内
@@ -41,11 +45,11 @@ data class StreamSlotRect(
      */
     fun toGLViewport(surfaceWidth: Int, surfaceHeight: Int): GLViewport {
         val x = (normalizedLeft * surfaceWidth).toInt()
-        val width = (normalizedWidth * surfaceWidth).toInt().coerceAtLeast(1)
-        val height = (normalizedHeight * surfaceHeight).toInt().coerceAtLeast(1)
+        val w = (normalizedWidth * surfaceWidth).toInt().coerceAtLeast(1)
+        val h = (normalizedHeight * surfaceHeight).toInt().coerceAtLeast(1)
         // OpenGL 的 Y 坐标计算：以左下角为基准
         val y = ((1.0f - normalizedBottom) * surfaceHeight).toInt().coerceAtLeast(0)
-        return GLViewport(x = x, y = y, width = width, height = height)
+        return GLViewport(x = x, y = y, width = w, height = h)
     }
 }
 

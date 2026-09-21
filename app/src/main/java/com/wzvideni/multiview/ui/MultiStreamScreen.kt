@@ -28,18 +28,18 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.wzvideni.multiview.state.MultiViewAction
 
 /**
- * 完整的多路流监控页面（最多支持 32 路 RTSP 并发展示、单路点击感知与全屏放大）
+ * 完整的多路流监控页面（支持 1 ~ 32 路 RTSP 并发展示、自适应分屏、长按拖动调换、全屏手势滑动）
  */
 @Composable
 fun MultiStreamScreen(
@@ -163,7 +163,7 @@ private fun TopStreamNavBar(
 
             Spacer(modifier = Modifier.width(8.dp))
 
-            val countOptions = listOf(4, 9, 16, 25, 32)
+            val countOptions = listOf(1, 2, 4, 6, 8, 9, 16, 25, 32)
             Row(
                 modifier = Modifier
                     .weight(1f)
@@ -179,7 +179,7 @@ private fun TopStreamNavBar(
                             containerColor = if (isSelected) Color(0xFF00B0FF) else Color(0xFF222C3E)
                         ),
                         shape = RoundedCornerShape(6.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                         modifier = Modifier
                             .defaultMinSize(minWidth = 1.dp, minHeight = 28.dp)
                             .height(28.dp)

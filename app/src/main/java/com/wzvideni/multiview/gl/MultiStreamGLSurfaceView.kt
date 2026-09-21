@@ -4,6 +4,7 @@ import android.content.Context
 import android.opengl.GLSurfaceView
 import android.util.AttributeSet
 import com.wzvideni.multiview.layout.MultiViewLayoutManager
+import com.wzvideni.multiview.layout.StreamSlotRect
 import com.wzvideni.multiview.model.LayoutMode
 
 /**
@@ -25,7 +26,7 @@ class MultiStreamGLSurfaceView @JvmOverloads constructor(
     /**
      * 根据像素坐标查找点击的通道槽位
      */
-    fun findSlotAt(pxX: Float, pxY: Float): Int? {
+    fun findSlotAt(pxX: Float, pxY: Float): StreamSlotRect? {
         val slots = renderer.getCurrentSlots()
         return MultiViewLayoutManager.findSlotAt(
             pxX = pxX,
@@ -39,9 +40,15 @@ class MultiStreamGLSurfaceView @JvmOverloads constructor(
     /**
      * 切换分屏布局
      */
-    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1, selectedIndex: Int = 0) {
+    fun updateLayout(
+        mode: LayoutMode,
+        count: Int,
+        pageIndex: Int = 0,
+        fullscreenIndex: Int = -1,
+        selectedIndex: Int = 0
+    ) {
         queueEvent {
-            renderer.updateLayout(mode, count, fullscreenIndex, selectedIndex)
+            renderer.updateLayout(mode, count, pageIndex, fullscreenIndex, selectedIndex)
         }
     }
 

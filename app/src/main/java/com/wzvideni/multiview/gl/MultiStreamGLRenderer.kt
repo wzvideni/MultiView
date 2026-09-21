@@ -33,7 +33,7 @@ import javax.microedition.khronos.opengles.GL10
  * 1. 杜绝创建 16~32 个 View/TextureView 的显存消耗与系统图层合成压力；
  * 2. 支持 ExoPlayer / MediaCodec 硬件解码直接输出到 SurfaceTexture (GL_TEXTURE_EXTERNAL_OES)；
  * 3. 保证各通道独立渲染与超低时延，同时支持未接入真实流通道的科技感模拟画面；
- * 4. 完美支持单路全屏无缝切换与命中测试联动。
+ * 4. 完美支持单路全屏无缝切换、空槽位剔除、多页分屏与命中测试联动。
  */
 class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
@@ -185,10 +185,13 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     private var surfaceHeight = 1080
 
     @Volatile
-    private var layoutMode: LayoutMode = LayoutMode.GRID_16
+    private var layoutMode: LayoutMode = LayoutMode.AUTO
 
     @Volatile
     private var streamCount: Int = 16
+
+    @Volatile
+    private var pageIndex: Int = 0
 
     @Volatile
     private var fullscreenChannelIndex: Int = -1 // -1 代表非全屏（宫格模式）
@@ -222,12 +225,25 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     /**
      * 更新布局模式与流数量
      */
-    fun updateLayout(mode: LayoutMode, count: Int, fullscreenIndex: Int = -1, selectedIndex: Int = 0) {
+    fun updateLayout(
+        mode: LayoutMode,
+        count: Int,
+        pageIndex: Int = 0,
+        fullscreenIndex: Int = -1,
+        selectedIndex: Int = 0
+    ) {
         this.layoutMode = mode
-        this.streamCount = count.coerceIn(1, MAX_CHANNELS)
+        this.streamCount = count.coerceIn(0, MAX_CHANNELS)
+        this.pageIndex = pageIndex
         this.fullscreenChannelIndex = fullscreenIndex
         this.selectedChannelIndex = selectedIndex
-        this.currentSlots = MultiViewLayoutManager.calculateSlots(mode, streamCount, fullscreenIndex, selectedIndex)
+        this.currentSlots = MultiViewLayoutManager.calculateSlots(
+            mode = mode,
+            streamCount = streamCount,
+            pageIndex = pageIndex,
+            fullscreenChannelIndex = fullscreenIndex,
+            selectedChannelIndex = selectedIndex
+        )
     }
 
     /**
@@ -236,7 +252,13 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     fun setSelectedChannel(index: Int) {
         this.selectedChannelIndex = index
         if (layoutMode == LayoutMode.GRID_1 || fullscreenChannelIndex >= 0) {
-            this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex, index)
+            this.currentSlots = MultiViewLayoutManager.calculateSlots(
+                mode = layoutMode,
+                streamCount = streamCount,
+                pageIndex = pageIndex,
+                fullscreenChannelIndex = fullscreenChannelIndex,
+                selectedChannelIndex = index
+            )
         }
     }
 
@@ -246,7 +268,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     fun getCurrentSlots(): List<StreamSlotRect> = currentSlots
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0.04f, 0.05f, 0.07f, 1.0f)
+        GLES20.glClearColor(0.043f, 0.067f, 0.078f, 1.0f) // #0B1114
 
         textureProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, TEXTURE_FRAGMENT_SHADER_CODE)
         proceduralProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, PROCEDURAL_FRAGMENT_SHADER_CODE)
@@ -295,7 +317,13 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         this.surfaceWidth = width
         this.surfaceHeight = height
         GLES20.glViewport(0, 0, width, height)
-        this.currentSlots = MultiViewLayoutManager.calculateSlots(layoutMode, streamCount, fullscreenChannelIndex, selectedChannelIndex)
+        this.currentSlots = MultiViewLayoutManager.calculateSlots(
+            mode = layoutMode,
+            streamCount = streamCount,
+            pageIndex = pageIndex,
+            fullscreenChannelIndex = fullscreenChannelIndex,
+            selectedChannelIndex = selectedChannelIndex
+        )
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -310,7 +338,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
         // 更新有新视频帧可用的 SurfaceTexture 硬件纹理
         for (slot in slots) {
-            val channelIdx = slot.slotIndex
+            val channelIdx = slot.channelIndex
             if (channelIdx in 0 until MAX_CHANNELS) {
                 if (frameAvailableFlags[channelIdx].getAndSet(false)) {
                     val st = surfaceTextures[channelIdx]
@@ -329,13 +357,14 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
         // 单路全屏模式优先处理
         if (fullscreenChannelIndex >= 0) {
-            if (frameAvailableFlags[fullscreenChannelIndex].getAndSet(false)) {
-                val st = surfaceTextures[fullscreenChannelIndex]
+            val chIdx = fullscreenChannelIndex.coerceIn(0, MAX_CHANNELS - 1)
+            if (frameAvailableFlags[chIdx].getAndSet(false)) {
+                val st = surfaceTextures[chIdx]
                 if (st != null) {
                     try {
                         st.updateTexImage()
-                        st.getTransformMatrix(texMatrices[fullscreenChannelIndex])
-                        hasOesFrame[fullscreenChannelIndex] = true
+                        st.getTransformMatrix(texMatrices[chIdx])
+                        hasOesFrame[chIdx] = true
                     } catch (e: Exception) {
                         Log.w(TAG, "updateTexImage fullscreen failed: ${e.message}")
                     }
@@ -343,7 +372,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             }
 
             drawChannel(
-                channelIndex = fullscreenChannelIndex,
+                channelIndex = chIdx,
                 glX = 0,
                 glY = 0,
                 glW = surfaceWidth,
@@ -355,19 +384,36 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
         // 宫格模式：遍历每一个视口并绘制对应通道
         for (slot in slots) {
-            val channelIdx = slot.slotIndex
-            if (channelIdx >= MAX_CHANNELS) continue
+            val vx = (slot.normalizedLeft * surfaceWidth).toInt()
+            val vy = ((1.0f - slot.normalizedBottom) * surfaceHeight).toInt()
+            val vw = ((slot.normalizedRight - slot.normalizedLeft) * surfaceWidth).toInt()
+            val vh = ((slot.normalizedBottom - slot.normalizedTop) * surfaceHeight).toInt()
 
-            val vp = slot.toGLViewport(surfaceWidth, surfaceHeight)
-            drawChannel(
-                channelIndex = channelIdx,
-                glX = vp.x,
-                glY = vp.y,
-                glW = vp.width,
-                glH = vp.height,
-                timeSec = currentTimeSec
-            )
+            if (slot.isEmptySlot || slot.channelIndex < 0 || slot.channelIndex >= MAX_CHANNELS) {
+                // 空槽位：绘制深色背景
+                drawEmptySlot(vx, vy, vw, vh)
+            } else {
+                drawChannel(
+                    channelIndex = slot.channelIndex,
+                    glX = vx,
+                    glY = vy,
+                    glW = vw,
+                    glH = vh,
+                    timeSec = currentTimeSec
+                )
+            }
         }
+    }
+
+    private fun drawEmptySlot(glX: Int, glY: Int, glW: Int, glH: Int) {
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        GLES20.glScissor(glX, glY, glW, glH)
+        GLES20.glViewport(glX, glY, glW, glH)
+
+        GLES20.glClearColor(0.043f, 0.067f, 0.078f, 1.0f) // #0B1114
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
     private fun drawChannel(channelIndex: Int, glX: Int, glY: Int, glW: Int, glH: Int, timeSec: Float) {
@@ -442,7 +488,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             GLES20.glEnableVertexAttribArray(aTexCoord)
             GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
 
-            val baseColor = channelBaseColors[channelIndex]
+            val baseColor = channelBaseColors[channelIndex % MAX_CHANNELS]
             GLES20.glUniform3f(uBaseColor, baseColor[0], baseColor[1], baseColor[2])
             GLES20.glUniform1f(uTime, timeSec)
             GLES20.glUniform1f(uChannelIndex, channelIndex.toFloat())
@@ -482,12 +528,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         val canvas = Canvas(bitmap)
 
         // 绘制深色工业背景
-        canvas.drawColor(Color.rgb(18, 24, 32))
+        canvas.drawColor(Color.rgb(11, 17, 20))
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(40, 50, 65)
+            color = Color.rgb(48, 82, 114)
             style = Paint.Style.STROKE
-            strokeWidth = 2f
+            strokeWidth = 1.5f
         }
 
         // 网格线
@@ -501,7 +547,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         // 居中通道编号
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(0, 229, 255)
-            textSize = 28f
+            textSize = 24f
             textAlign = Paint.Align.CENTER
         }
         val channelNum = String.format("%02d", channelIndex + 1)
@@ -546,7 +592,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         uData: ByteBuffer,
         vData: ByteBuffer
     ) {
-        // 后续对接 Native YUV 解码时使用
+        // 对接 Native YUV 解码时使用
     }
 
     override fun setTestPatternEnabled(enabled: Boolean) {

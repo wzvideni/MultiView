@@ -14,12 +14,15 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -65,14 +68,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
- * 多路视频流聚合播放器核心组件 (Compose Plan A 实现)
+ * 多路视频流聚合播放器核心组件
  *
- * 特性：
- * 1. 单 SurfaceView + OpenGL ES 视口复用，支持 1 ~ 32 路画面极低开销并发渲染；
- * 2. 单画面模式（全屏或 1画面）下支持流畅手势左右滑动切换通道与无缝动画；
- * 3. 精确命中测试：点击任意流可即时获得通道索引；
- * 4. 画面无缝全屏放大与恢复；
- * 5. 支持辅码流（流畅预览）与主码流（全屏高清）动态切换。
+ * 核心特性：
+ * 1. 单 SurfaceView + OpenGL ES 视口复用，支持 1 ~ 32 路画面极低开销并发硬件渲染；
+ * 2. 完美支持自适应布局（1/2/4/6/9 分屏及 9+ 分页），支持空槽位平滑渲染；
+ * 3. 增强播放重试机制：错峰启动、超时保护、指数退避自动重连；
+ * 4. 长按拖动调换窗口顺序：触点光圈、浮动预览卡片、目标窗口悬停高亮提示；
+ * 5. 全屏/单画面下流畅左右滑动手势切换上一路/下一路并带边缘卡片提示；
+ * 6. 9+ 画面宫格模式支持左右滑动分页与底部分页指示器。
  */
 @Composable
 fun MultiStreamPlayerView(
@@ -83,25 +87,49 @@ fun MultiStreamPlayerView(
     showControls: Boolean = true
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val playerManager = remember { RtspStreamPlayerManager(context) }
     var surfaceViewRef by remember { mutableStateOf<MultiStreamGLSurfaceView?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
+    // 监听播放器状态变动并通知 ViewModel
+    LaunchedEffect(playerManager) {
+        playerManager.onChannelStatusChanged = { channelIndex, status ->
+            onAction(MultiViewAction.UpdateChannelStatus(channelIndex, status))
+        }
+    }
+
     // 计算当前布局的所有槽位几何位置
-    val currentSlots = remember(state.layoutMode, state.streamCount, state.isFullscreen, state.fullscreenChannelIndex, state.selectedChannelIndex) {
+    val currentSlots = remember(
+        state.layoutMode,
+        state.streamCount,
+        state.currentPage,
+        state.isFullscreen,
+        state.fullscreenChannelIndex,
+        state.selectedChannelIndex
+    ) {
         MultiViewLayoutManager.calculateSlots(
             mode = state.layoutMode,
             streamCount = state.streamCount,
+            pageIndex = state.currentPage,
             fullscreenChannelIndex = if (state.isFullscreen) state.fullscreenChannelIndex else -1,
             selectedChannelIndex = state.selectedChannelIndex
         )
     }
 
-    // 布局模式、全屏状态或选中通道变化时通知底层 OpenGL 渲染器更新视口
-    LaunchedEffect(state.layoutMode, state.streamCount, state.isFullscreen, state.fullscreenChannelIndex, state.selectedChannelIndex) {
+    // 通知底层 OpenGL 渲染器更新视口与布局
+    LaunchedEffect(
+        state.layoutMode,
+        state.streamCount,
+        state.currentPage,
+        state.isFullscreen,
+        state.fullscreenChannelIndex,
+        state.selectedChannelIndex
+    ) {
         surfaceViewRef?.updateLayout(
             mode = state.layoutMode,
             count = state.streamCount,
+            pageIndex = state.currentPage,
             fullscreenIndex = if (state.isFullscreen) state.fullscreenChannelIndex else -1,
             selectedIndex = state.selectedChannelIndex
         )
@@ -112,9 +140,9 @@ fun MultiStreamPlayerView(
         surfaceViewRef?.setSelectedChannel(state.selectedChannelIndex)
     }
 
-    // 动态智能调度 RTSP 播放器拉流
+    // 动态智能调度 RTSP 播放器拉流 (包含错峰启动与重试)
     LaunchedEffect(state.channels, currentSlots, state.isFullscreen, state.fullscreenChannelIndex) {
-        val visibleIndices = currentSlots.map { it.slotIndex }
+        val visibleIndices = currentSlots.filter { !it.isEmptySlot }.map { it.channelIndex }
         playerManager.updateStreams(
             channels = state.channels,
             visibleIndices = visibleIndices,
@@ -123,8 +151,16 @@ fun MultiStreamPlayerView(
         )
     }
 
+    DisposableEffect(Unit) {
+        onDispose {
+            playerManager.releaseAll()
+            surfaceViewRef?.onDestroy()
+            surfaceViewRef = null
+        }
+    }
+
     // --- 单画面模式左右滑动切换手势与动画控制 ---
-    val isSingleView = state.isFullscreen || state.layoutMode == LayoutMode.GRID_1
+    val isSingleView = state.isFullscreen || (state.layoutMode == LayoutMode.GRID_1 && state.streamCount == 1)
     val activeChannelIndex = if (state.isFullscreen && state.fullscreenChannelIndex >= 0) {
         state.fullscreenChannelIndex
     } else {
@@ -140,10 +176,9 @@ fun MultiStreamPlayerView(
     val prevChannel = state.channels.getOrNull(prevChannelIndex)
     val nextChannel = state.channels.getOrNull(nextChannelIndex)
 
-    val coroutineScope = rememberCoroutineScope()
     val offsetX = remember { Animatable(0f) }
-    var isDragging by remember { mutableStateOf(false) }
-    var isAnimating by remember { mutableStateOf(false) }
+    var isDraggingFullscreen by remember { mutableStateOf(false) }
+    var isAnimatingFullscreen by remember { mutableStateOf(false) }
 
     // 切换通道后的悬浮 OSD HUD
     var switchHudChannel by remember { mutableStateOf<StreamChannel?>(null) }
@@ -153,24 +188,24 @@ fun MultiStreamPlayerView(
         hudJob?.cancel()
         switchHudChannel = channel
         hudJob = coroutineScope.launch {
-            delay(2500)
+            delay(2200)
             switchHudChannel = null
         }
     }
 
+    // 手势拦截 Modifier 构造
     val gestureModifier = if (isSingleView && totalChannels > 1) {
+        // 全屏/单画面模式：左右滑动切换上下路通道
         Modifier.pointerInput(isSingleView, containerSize.width, totalChannels, activeChannelIndex) {
-            val width = size.width.toFloat().coerceAtLeast(1080f)
-            val threshold = (width * 0.15f).coerceIn(100f, 300f)
+            val width = size.width.toFloat().coerceAtLeast(800f)
+            val threshold = (width * 0.15f).coerceIn(80f, 250f)
 
             detectHorizontalDragGestures(
                 onDragStart = {
-                    if (!isAnimating) {
-                        isDragging = true
-                    }
+                    if (!isAnimatingFullscreen) isDraggingFullscreen = true
                 },
                 onHorizontalDrag = { change, dragAmount ->
-                    if (!isAnimating) {
+                    if (!isAnimatingFullscreen) {
                         change.consume()
                         coroutineScope.launch {
                             offsetX.snapTo(offsetX.value + dragAmount)
@@ -178,38 +213,57 @@ fun MultiStreamPlayerView(
                     }
                 },
                 onDragEnd = {
-                    if (isAnimating) return@detectHorizontalDragGestures
-                    isDragging = false
+                    if (isAnimatingFullscreen) return@detectHorizontalDragGestures
+                    isDraggingFullscreen = false
                     val currentVal = offsetX.value
                     coroutineScope.launch {
                         if (currentVal < -threshold) {
                             // 向左滑动 -> 切换到下一路
-                            isAnimating = true
-                            offsetX.animateTo(-width, tween(140, easing = FastOutLinearInEasing))
+                            isAnimatingFullscreen = true
+                            offsetX.animateTo(-width, tween(120, easing = FastOutLinearInEasing))
                             onAction(MultiViewAction.SwitchToAdjacentChannel(isNext = true))
                             triggerSwitchHud(nextChannel)
                             offsetX.snapTo(width)
-                            offsetX.animateTo(0f, tween(220, easing = LinearOutSlowInEasing))
-                            isAnimating = false
+                            offsetX.animateTo(0f, tween(200, easing = LinearOutSlowInEasing))
+                            isAnimatingFullscreen = false
                         } else if (currentVal > threshold) {
                             // 向右滑动 -> 切换到上一路
-                            isAnimating = true
-                            offsetX.animateTo(width, tween(140, easing = FastOutLinearInEasing))
+                            isAnimatingFullscreen = true
+                            offsetX.animateTo(width, tween(120, easing = FastOutLinearInEasing))
                             onAction(MultiViewAction.SwitchToAdjacentChannel(isNext = false))
                             triggerSwitchHud(prevChannel)
                             offsetX.snapTo(-width)
-                            offsetX.animateTo(0f, tween(220, easing = LinearOutSlowInEasing))
-                            isAnimating = false
+                            offsetX.animateTo(0f, tween(200, easing = LinearOutSlowInEasing))
+                            isAnimatingFullscreen = false
                         } else {
-                            // 未达到滑动切换阈值，回弹恢复
+                            // 未达切换阈值，弹性回弹
                             offsetX.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
                         }
                     }
                 },
                 onDragCancel = {
-                    isDragging = false
+                    isDraggingFullscreen = false
                     coroutineScope.launch {
                         offsetX.animateTo(0f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
+                    }
+                }
+            )
+        }
+    } else if (!state.isFullscreen && state.totalPages > 1) {
+        // 多画面分页模式：左右横向滑动切换页面
+        Modifier.pointerInput(state.currentPage, state.totalPages) {
+            var totalDrag = 0f
+            detectHorizontalDragGestures(
+                onDragStart = { totalDrag = 0f },
+                onHorizontalDrag = { change, dragAmount ->
+                    change.consume()
+                    totalDrag += dragAmount
+                },
+                onDragEnd = {
+                    if (totalDrag < -100f && state.currentPage < state.totalPages - 1) {
+                        onAction(MultiViewAction.SwitchPage(state.currentPage + 1))
+                    } else if (totalDrag > 100f && state.currentPage > 0) {
+                        onAction(MultiViewAction.SwitchPage(state.currentPage - 1))
                     }
                 }
             )
@@ -221,7 +275,7 @@ fun MultiStreamPlayerView(
     Box(
         modifier = modifier
             .fillMaxSize()
-            .background(Color(0xFF0A0E14))
+            .background(Color(0xFF0B1114))
             .onSizeChanged { containerSize = it }
             .then(gestureModifier)
     ) {
@@ -233,11 +287,11 @@ fun MultiStreamPlayerView(
                     .padding(end = 24.dp)
                     .background(
                         brush = Brush.horizontalGradient(
-                            listOf(Color(0xCC0D1B2A), Color(0xF216293D))
+                            listOf(Color(0xCC050C19), Color(0xF21F3952))
                         ),
-                        shape = RoundedCornerShape(14.dp)
+                        shape = RoundedCornerShape(12.dp)
                     )
-                    .border(1.5.dp, Color(0xFF00E5FF).copy(alpha = 0.8f), RoundedCornerShape(14.dp))
+                    .border(1.5.dp, Color(0xFF00E5FF), RoundedCornerShape(12.dp))
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -256,14 +310,14 @@ fun MultiStreamPlayerView(
                     )
                     Text(
                         text = "${nextChannel?.resolution ?: "1080P"} · ${nextChannel?.fps ?: 25}fps",
-                        color = Color(0xB3FFFFFF),
+                        color = Color(0xCCFFFFFF),
                         fontSize = 11.sp
                     )
                 }
-                Spacer(modifier = Modifier.width(10.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Box(
                     modifier = Modifier
-                        .size(32.dp)
+                        .size(28.dp)
                         .background(Color(0x3300E5FF), CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
@@ -271,7 +325,7 @@ fun MultiStreamPlayerView(
                         imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                         contentDescription = "Next",
                         tint = Color(0xFF00E5FF),
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
@@ -284,17 +338,17 @@ fun MultiStreamPlayerView(
                     .padding(start = 24.dp)
                     .background(
                         brush = Brush.horizontalGradient(
-                            listOf(Color(0xF216293D), Color(0xCC0D1B2A))
+                            listOf(Color(0xF21F3952), Color(0xCC050C19))
                         ),
-                        shape = RoundedCornerShape(14.dp)
+                        shape = RoundedCornerShape(12.dp)
                     )
-                    .border(1.5.dp, Color(0xFF00E5FF).copy(alpha = 0.8f), RoundedCornerShape(14.dp))
+                    .border(1.5.dp, Color(0xFF00E5FF), RoundedCornerShape(12.dp))
                     .padding(horizontal = 16.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(32.dp)
+                        .size(28.dp)
                         .background(Color(0x3300E5FF), CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
@@ -302,10 +356,10 @@ fun MultiStreamPlayerView(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Previous",
                         tint = Color(0xFF00E5FF),
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
-                Spacer(modifier = Modifier.width(10.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Column(horizontalAlignment = Alignment.Start) {
                     Text(
                         text = "松开切换至上一路",
@@ -321,14 +375,14 @@ fun MultiStreamPlayerView(
                     )
                     Text(
                         text = "${prevChannel?.resolution ?: "1080P"} · ${prevChannel?.fps ?: 25}fps",
-                        color = Color(0xB3FFFFFF),
+                        color = Color(0xCCFFFFFF),
                         fontSize = 11.sp
                     )
                 }
             }
         }
 
-        // B. 视频渲染与槽位覆盖层（随滑动手势与切换动画平移）
+        // B. 视频渲染与槽位覆盖层（全屏手势时跟随平移）
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -336,7 +390,7 @@ fun MultiStreamPlayerView(
                     translationX = if (isSingleView) offsetX.value else 0f
                 }
         ) {
-            // 1. 底层：单一 OpenGL ES SurfaceView 负责所有 1~32 路视频画面的视口合成绘制
+            // 1. 底层：OpenGL ES 单 SurfaceView 视口复用合成
             AndroidView(
                 factory = { ctx ->
                     MultiStreamGLSurfaceView(ctx).also { view ->
@@ -351,31 +405,33 @@ fun MultiStreamPlayerView(
                 }
             )
 
-            DisposableEffect(Unit) {
-                onDispose {
-                    playerManager.releaseAll()
-                    surfaceViewRef?.onDestroy()
-                    surfaceViewRef = null
-                }
-            }
-
-            // 2. 中层：Compose 交互与 OSD 覆盖层（负责手势拦截、命中测试、聚焦边框）
+            // 2. 中层：Compose 槽位交互与 OSD 覆盖层（长按拖动换位、高亮边框、状态徽标）
             MultiStreamOverlay(
                 slots = currentSlots,
                 channels = state.channels,
                 selectedChannelIndex = state.selectedChannelIndex,
                 isFullscreen = state.isFullscreen,
+                showTooltip = state.showTooltip,
                 containerSize = containerSize,
-                onChannelClick = { channelIndex, _ ->
+                onChannelClick = { channelIndex ->
                     onAction(MultiViewAction.SelectChannel(channelIndex))
                 },
-                onChannelDoubleClick = { channelIndex, _ ->
+                onChannelDoubleClick = { channelIndex ->
                     onAction(MultiViewAction.ToggleFullscreen(channelIndex))
+                },
+                onEmptySlotClick = {
+                    onAction(MultiViewAction.SelectChannel(0))
+                },
+                onCloseChannel = { channelIndex ->
+                    onAction(MultiViewAction.CloseChannel(channelIndex))
+                },
+                onSwapChannels = { from, to ->
+                    onAction(MultiViewAction.SwapChannels(from, to))
                 }
             )
         }
 
-        // C. 通道切换悬浮 OSD HUD 通知条
+        // C. 通道切换悬浮 OSD HUD 通知胶囊
         AnimatedVisibility(
             visible = switchHudChannel != null,
             enter = fadeIn(animationSpec = tween(200)) + slideInVertically(initialOffsetY = { -it / 2 }),
@@ -385,9 +441,9 @@ fun MultiStreamPlayerView(
                 .padding(top = if (state.isFullscreen) 58.dp else 16.dp)
         ) {
             Surface(
-                color = Color(0xF00D1520),
+                color = Color(0xF0050C19),
                 shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, Color(0xFF00E5FF).copy(alpha = 0.7f)),
+                border = BorderStroke(1.dp, Color(0xFF00E5FF)),
                 shadowElevation = 8.dp
             ) {
                 Row(
@@ -397,47 +453,39 @@ fun MultiStreamPlayerView(
                     Box(
                         modifier = Modifier
                             .size(8.dp)
-                            .background(Color(0xFF00E676), CircleShape)
+                            .background(Color(0xFF2CE898), CircleShape)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = switchHudChannel?.name ?: "",
                         color = Color.White,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "·",
-                        color = Color(0x66FFFFFF),
-                        fontSize = 13.sp
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
                         text = "${switchHudChannel?.resolution ?: "1080P"} · ${switchHudChannel?.fps ?: 25}fps",
                         color = Color(0xFF00E5FF),
                         fontSize = 12.sp
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Surface(
-                        color = Color(0x3300E5FF),
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = if (switchHudChannel?.isMainStream == true) "高清主码流" else "流畅子码流",
-                            color = Color(0xFF00E5FF),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                        )
-                    }
                 }
             }
         }
 
-        // D. 顶层：控制工具栏（固定定位，不随视频手势平移）
+        // D. 9+ 画面底部分页圆点指示器
+        if (!state.isFullscreen && state.totalPages > 1) {
+            MultiStreamPageIndicator(
+                totalPages = state.totalPages,
+                currentPage = state.currentPage,
+                onPageClick = { page -> onAction(MultiViewAction.SwitchPage(page)) },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = if (showControls) 80.dp else 16.dp)
+            )
+        }
+
+        // E. 全屏模式专属控制器
         if (state.isFullscreen) {
-            // 全屏模式控制栏
             FullscreenControls(
                 channel = state.currentFullscreenChannel,
                 channelIndex = state.fullscreenChannelIndex,
@@ -464,6 +512,60 @@ fun MultiStreamPlayerView(
                     onAction(MultiViewAction.ToggleFullscreen(channelIndex))
                 },
                 modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
+
+        // F. 浮动 Toast 提示胶囊
+        AnimatedVisibility(
+            visible = state.toastMessage != null,
+            enter = fadeIn(tween(150)) + slideInVertically(initialOffsetY = { it }),
+            exit = fadeOut(tween(200)) + slideOutVertically(targetOffsetY = { it }),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = if (showControls && !state.isFullscreen) 90.dp else 40.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .background(Color(0xE6050C19), RoundedCornerShape(20.dp))
+                    .border(1.dp, Color(0xFF00E5FF), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+            ) {
+                Text(
+                    text = state.toastMessage ?: "",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 9+ 画面分页指示器
+ */
+@Composable
+fun MultiStreamPageIndicator(
+    totalPages: Int,
+    currentPage: Int,
+    onPageClick: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        for (page in 0 until totalPages) {
+            val isCurrent = (page == currentPage)
+            Box(
+                modifier = Modifier
+                    .size(if (isCurrent) 10.dp else 8.dp)
+                    .background(
+                        if (isCurrent) Color(0xFF00E5FF) else Color(0x40FFFFFF),
+                        CircleShape
+                    )
+                    .clickable { onPageClick(page) }
             )
         }
     }

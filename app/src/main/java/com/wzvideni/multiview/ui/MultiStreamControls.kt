@@ -22,13 +22,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wzvideni.multiview.model.LayoutMode
 
 /**
- * 分屏模式底部的控制栏（支持切换 1/4/9/16/25/32 分屏及特色 1+5 布局）
+ * 分屏模式底部的控制栏（支持自适应、1/2/4/6/9/16/25/32 分屏及特色 1+5 布局）
  */
 @Composable
 fun MultiStreamControls(
@@ -40,8 +39,11 @@ fun MultiStreamControls(
     modifier: Modifier = Modifier
 ) {
     val modes = listOf(
+        LayoutMode.AUTO,
         LayoutMode.GRID_1,
+        LayoutMode.GRID_2,
         LayoutMode.GRID_4,
+        LayoutMode.GRID_6,
         LayoutMode.GRID_9,
         LayoutMode.GRID_16,
         LayoutMode.GRID_25,
@@ -68,6 +70,14 @@ fun MultiStreamControls(
                     color = Color(0xFF00E5FF),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
+                )
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Text(
+                    text = "当前模式: ${currentMode.title}",
+                    color = Color(0xFF818FA0),
+                    fontSize = 12.sp
                 )
 
                 Spacer(modifier = Modifier.width(12.dp))
@@ -114,7 +124,7 @@ fun MultiStreamControls(
                 Button(
                     onClick = { onModeSelected(mode) },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isSelected) Color(0xFF00E676) else Color(0xFF263248)
+                        containerColor = if (isSelected) Color(0xFF00E5FF) else Color(0xFF263248)
                     ),
                     shape = RoundedCornerShape(8.dp),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
@@ -134,4 +144,3 @@ fun MultiStreamControls(
         }
     }
 }
-

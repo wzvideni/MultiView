@@ -38,13 +38,12 @@ if %errorlevel% neq 0 (
 
 where adb >nul 2>nul
 if %errorlevel% equ 0 (
-    echo [ADB 端口反向代理] 正在检查并配置已连接的 Android 设备...
-    for /f "tokens=1" %%d in ('adb devices ^| findstr /r /c:"[a-zA-Z0-9].*device$"') do (
-        adb -s %%d reverse tcp:8554 tcp:8554 >nul 2>&1
-        echo    - 设备 %%d: 反向代理就绪 [手机 127.0.0.1:8554 -^> 电脑 8554]
-    )
+    echo [ADB 端口反向代理] 正在启动后台自动代理守护进程 [支持热插拔]...
     start "" /b powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0adb_reverse_daemon.ps1"
-    echo [ADB 服务] 后台自动守护进程已就绪。
+    for /f "tokens=1" %%d in ('adb devices 2^>nul ^| findstr /r /c:"[a-zA-Z0-9].*device$"') do (
+        echo    - 检测到 Android 设备: %%d [后台自动完成 8554 端口反向代理]
+    )
+    echo [ADB 服务] 反向代理守护进程已在后台运行 [异步执行，不阻塞 MediaMTX 启动]。
     echo.
 )
 
@@ -68,9 +67,13 @@ echo 提示: 按 Ctrl+C 可停止服务
 echo.
 
 %MEDIAMTX_CMD% mediamtx.yml
+set "EXIT_CODE=%errorlevel%"
 
-if %errorlevel% neq 0 (
+REM 停止后台的 ADB 守护进程
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name = 'powershell.exe' or Name = 'pwsh.exe'\" | Where-Object { $_.CommandLine -like '*adb_reverse_daemon.ps1*' } | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
+
+if %EXIT_CODE% neq 0 (
     echo.
-    echo [错误] MediaMTX 异常退出，退出码: %errorlevel%
+    echo [错误] MediaMTX 异常退出，退出码: %EXIT_CODE%
     pause
 )

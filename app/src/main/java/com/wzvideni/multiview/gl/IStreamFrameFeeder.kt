@@ -42,4 +42,9 @@ interface IStreamFrameFeeder {
      * 清空指定通道的画面（恢复为空闲等待画面）
      */
     fun clearChannel(channelIndex: Int)
+
+    /**
+     * 注册通道视频帧到达/渲染监听（供看门狗检测冻结与断流）
+     */
+    fun setOnFrameRenderedListener(listener: ((channelIndex: Int) -> Unit)?)
 }

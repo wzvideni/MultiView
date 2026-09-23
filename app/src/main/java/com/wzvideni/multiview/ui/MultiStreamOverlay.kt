@@ -126,7 +126,7 @@ fun MultiStreamOverlay(
                     onDragEnd = {
                         val source = dragSourceSlot
                         val target = hoverTargetSlot
-                        if (source != null && target != null) {
+                        if (source != null && target != null && source.slotIndex != target.slotIndex) {
                             val targetIndex = if (target.isEmptySlot) {
                                 (channels.size - 1).coerceAtLeast(0)
                             } else {
@@ -327,6 +327,28 @@ fun MultiStreamOverlay(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
+
+                            if (channel.status == StreamStatus.CONNECTING) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "连接中...",
+                                    color = Color(0xFFFFB300),
+                                    fontSize = 10.sp,
+                                    modifier = Modifier
+                                        .background(Color(0x33FFB300), RoundedCornerShape(2.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            } else if (channel.status == StreamStatus.ERROR) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "已断开",
+                                    color = Color(0xFFE83434),
+                                    fontSize = 10.sp,
+                                    modifier = Modifier
+                                        .background(Color(0x33E83434), RoundedCornerShape(2.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                )
+                            }
 
                             if (channel.isMainStream && widthDp >= 200.dp) {
                                 Spacer(modifier = Modifier.width(6.dp))

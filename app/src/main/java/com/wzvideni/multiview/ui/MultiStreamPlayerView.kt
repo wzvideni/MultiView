@@ -93,9 +93,12 @@ fun MultiStreamPlayerView(
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
 
     // 监听播放器状态变动并通知 ViewModel
-    LaunchedEffect(playerManager) {
+    DisposableEffect(playerManager) {
         playerManager.onChannelStatusChanged = { channelIndex, status ->
             onAction(MultiViewAction.UpdateChannelStatus(channelIndex, status))
+        }
+        onDispose {
+            playerManager.onChannelStatusChanged = null
         }
     }
 
@@ -140,8 +143,15 @@ fun MultiStreamPlayerView(
         surfaceViewRef?.setSelectedChannel(state.selectedChannelIndex)
     }
 
+    // 提取流配置特征指纹，阻断仅因 channel.status 状态变动导致的 LaunchedEffect 频繁重组风暴
+    val streamConfigSignature = remember(state.channels) {
+        state.channels.map { ch ->
+            "${ch.id}_${ch.isMuted}_${ch.isMainStream}_${ch.rtspUrl}_${ch.subRtspUrl}_${ch.mainRtspUrl}"
+        }
+    }
+
     // 动态智能调度 RTSP 播放器拉流 (包含错峰启动与重试)
-    LaunchedEffect(state.channels, currentSlots, state.isFullscreen, state.fullscreenChannelIndex) {
+    LaunchedEffect(streamConfigSignature, currentSlots, state.isFullscreen, state.fullscreenChannelIndex) {
         val visibleIndices = currentSlots.filter { !it.isEmptySlot }.map { it.channelIndex }
         playerManager.updateStreams(
             channels = state.channels,

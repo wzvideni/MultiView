@@ -165,6 +165,22 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     private var proceduralProgram = 0
     private var oesProgram = 0
 
+    // 缓存 Shader 变量句柄，消除 drawChannel 每帧频繁字符串查询带来的性能开销
+    private var oesAPosition = -1
+    private var oesATexCoord = -1
+    private var oesUTexMatrix = -1
+    private var oesUTexture = -1
+
+    private var texAPosition = -1
+    private var texATexCoord = -1
+    private var texUTexture = -1
+
+    private var procAPosition = -1
+    private var procATexCoord = -1
+    private var procUBaseColor = -1
+    private var procUTime = -1
+    private var procUChannelIndex = -1
+
     // 传统 2D 纹理（用于 feedRgbaFrame 离线帧）
     private val textureIds = IntArray(MAX_CHANNELS)
     private val hasRealFrame = BooleanArray(MAX_CHANNELS) { false }
@@ -177,6 +193,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     private val frameAvailableFlags = Array(MAX_CHANNELS) { AtomicBoolean(false) }
     private val texMatrices = Array(MAX_CHANNELS) { FloatArray(16) }
     private var onSurfaceAvailableListener: ((channelIndex: Int, surface: Surface) -> Unit)? = null
+    private var onFrameRenderedListener: ((channelIndex: Int) -> Unit)? = null
 
     @Volatile
     private var surfaceWidth = 1920
@@ -271,8 +288,22 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         GLES20.glClearColor(0.043f, 0.067f, 0.078f, 1.0f) // #0B1114
 
         textureProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, TEXTURE_FRAGMENT_SHADER_CODE)
+        texAPosition = GLES20.glGetAttribLocation(textureProgram, "aPosition")
+        texATexCoord = GLES20.glGetAttribLocation(textureProgram, "aTexCoord")
+        texUTexture = GLES20.glGetUniformLocation(textureProgram, "uTexture")
+
         proceduralProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, PROCEDURAL_FRAGMENT_SHADER_CODE)
+        procAPosition = GLES20.glGetAttribLocation(proceduralProgram, "aPosition")
+        procATexCoord = GLES20.glGetAttribLocation(proceduralProgram, "aTexCoord")
+        procUBaseColor = GLES20.glGetUniformLocation(proceduralProgram, "uBaseColor")
+        procUTime = GLES20.glGetUniformLocation(proceduralProgram, "uTime")
+        procUChannelIndex = GLES20.glGetUniformLocation(proceduralProgram, "uChannelIndex")
+
         oesProgram = GLShaderHelper.createProgram(OES_VERTEX_SHADER_CODE, OES_FRAGMENT_SHADER_CODE)
+        oesAPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
+        oesATexCoord = GLES20.glGetAttribLocation(oesProgram, "aTexCoord")
+        oesUTexMatrix = GLES20.glGetUniformLocation(oesProgram, "uTexMatrix")
+        oesUTexture = GLES20.glGetUniformLocation(oesProgram, "uTexture")
 
         // 1. 初始化 32 个传统 2D 纹理
         GLES20.glGenTextures(MAX_CHANNELS, textureIds, 0)
@@ -303,6 +334,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             val st = SurfaceTexture(oesTextureIds[i])
             st.setOnFrameAvailableListener {
                 frameAvailableFlags[channelIndex].set(true)
+                onFrameRenderedListener?.invoke(channelIndex)
             }
             surfaceTextures[i] = st
             val surf = Surface(st)
@@ -429,74 +461,59 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             // 方案 A：使用 OES 外部纹理渲染硬件解码视频（ExoPlayer / MediaCodec 零拷贝）
             GLES20.glUseProgram(oesProgram)
 
-            val aPosition = GLES20.glGetAttribLocation(oesProgram, "aPosition")
-            val aTexCoord = GLES20.glGetAttribLocation(oesProgram, "aTexCoord")
-            val uTexMatrix = GLES20.glGetUniformLocation(oesProgram, "uTexMatrix")
-            val uTexture = GLES20.glGetUniformLocation(oesProgram, "uTexture")
+            GLES20.glEnableVertexAttribArray(oesAPosition)
+            GLES20.glVertexAttribPointer(oesAPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
 
-            GLES20.glEnableVertexAttribArray(aPosition)
-            GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
+            GLES20.glEnableVertexAttribArray(oesATexCoord)
+            GLES20.glVertexAttribPointer(oesATexCoord, 2, GLES20.GL_FLOAT, false, 0, oesTexCoordBuffer)
 
-            GLES20.glEnableVertexAttribArray(aTexCoord)
-            GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 0, oesTexCoordBuffer)
-
-            GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrices[channelIndex], 0)
+            GLES20.glUniformMatrix4fv(oesUTexMatrix, 1, false, texMatrices[channelIndex], 0)
 
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureIds[channelIndex])
-            GLES20.glUniform1i(uTexture, 0)
+            GLES20.glUniform1i(oesUTexture, 0)
 
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, INDICES.size, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
 
-            GLES20.glDisableVertexAttribArray(aPosition)
-            GLES20.glDisableVertexAttribArray(aTexCoord)
+            GLES20.glDisableVertexAttribArray(oesAPosition)
+            GLES20.glDisableVertexAttribArray(oesATexCoord)
         } else if (isRgbaActive || !isTestPatternEnabled) {
             // 方案 B：使用 2D 纹理渲染软解/投递画面
             GLES20.glUseProgram(textureProgram)
 
-            val aPosition = GLES20.glGetAttribLocation(textureProgram, "aPosition")
-            val aTexCoord = GLES20.glGetAttribLocation(textureProgram, "aTexCoord")
-            val uTexture = GLES20.glGetUniformLocation(textureProgram, "uTexture")
+            GLES20.glEnableVertexAttribArray(texAPosition)
+            GLES20.glVertexAttribPointer(texAPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
 
-            GLES20.glEnableVertexAttribArray(aPosition)
-            GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
-
-            GLES20.glEnableVertexAttribArray(aTexCoord)
-            GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
+            GLES20.glEnableVertexAttribArray(texATexCoord)
+            GLES20.glVertexAttribPointer(texATexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
 
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureIds[channelIndex])
-            GLES20.glUniform1i(uTexture, 0)
+            GLES20.glUniform1i(texUTexture, 0)
 
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, INDICES.size, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
 
-            GLES20.glDisableVertexAttribArray(aPosition)
-            GLES20.glDisableVertexAttribArray(aTexCoord)
+            GLES20.glDisableVertexAttribArray(texAPosition)
+            GLES20.glDisableVertexAttribArray(texATexCoord)
         } else {
             // 方案 C：使用动态扫描着色器渲染科技感模拟监控背景
             GLES20.glUseProgram(proceduralProgram)
 
-            val aPosition = GLES20.glGetAttribLocation(proceduralProgram, "aPosition")
-            val aTexCoord = GLES20.glGetAttribLocation(proceduralProgram, "aTexCoord")
-            val uBaseColor = GLES20.glGetUniformLocation(proceduralProgram, "uBaseColor")
-            val uTime = GLES20.glGetUniformLocation(proceduralProgram, "uTime")
-            val uChannelIndex = GLES20.glGetUniformLocation(proceduralProgram, "uChannelIndex")
+            GLES20.glEnableVertexAttribArray(procAPosition)
+            GLES20.glVertexAttribPointer(procAPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
 
-            GLES20.glEnableVertexAttribArray(aPosition)
-            GLES20.glVertexAttribPointer(aPosition, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
-
-            GLES20.glEnableVertexAttribArray(aTexCoord)
-            GLES20.glVertexAttribPointer(aTexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
+            GLES20.glEnableVertexAttribArray(procATexCoord)
+            GLES20.glVertexAttribPointer(procATexCoord, 2, GLES20.GL_FLOAT, false, 0, texCoordBuffer)
 
             val baseColor = channelBaseColors[channelIndex % MAX_CHANNELS]
-            GLES20.glUniform3f(uBaseColor, baseColor[0], baseColor[1], baseColor[2])
-            GLES20.glUniform1f(uTime, timeSec)
-            GLES20.glUniform1f(uChannelIndex, channelIndex.toFloat())
+            GLES20.glUniform3f(procUBaseColor, baseColor[0], baseColor[1], baseColor[2])
+            GLES20.glUniform1f(procUTime, timeSec)
+            GLES20.glUniform1f(procUChannelIndex, channelIndex.toFloat())
 
             GLES20.glDrawElements(GLES20.GL_TRIANGLES, INDICES.size, GLES20.GL_UNSIGNED_SHORT, indexBuffer)
 
-            GLES20.glDisableVertexAttribArray(aPosition)
-            GLES20.glDisableVertexAttribArray(aTexCoord)
+            GLES20.glDisableVertexAttribArray(procAPosition)
+            GLES20.glDisableVertexAttribArray(procATexCoord)
         }
 
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
@@ -603,8 +620,13 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         if (channelIndex in 0 until MAX_CHANNELS) {
             hasRealFrame[channelIndex] = false
             hasOesFrame[channelIndex] = false
+            frameAvailableFlags[channelIndex].set(false)
             frameQueue.remove(channelIndex)
         }
+    }
+
+    override fun setOnFrameRenderedListener(listener: ((channelIndex: Int) -> Unit)?) {
+        this.onFrameRenderedListener = listener
     }
 
     fun release() {

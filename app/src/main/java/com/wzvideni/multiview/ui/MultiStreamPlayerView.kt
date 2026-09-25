@@ -55,6 +55,8 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.content.res.Configuration
+import androidx.compose.ui.platform.LocalConfiguration
 import com.wzvideni.multiview.gl.IStreamFrameFeeder
 import com.wzvideni.multiview.gl.MultiStreamGLSurfaceView
 import com.wzvideni.multiview.layout.MultiViewLayoutManager
@@ -88,6 +90,10 @@ fun MultiStreamPlayerView(
 ) {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    val configuration = LocalConfiguration.current
+    val isPortrait = configuration.orientation == Configuration.ORIENTATION_PORTRAIT
+    val isSmallScreen = configuration.screenWidthDp < 500
+
     val playerManager = remember { RtspStreamPlayerManager(context) }
     var surfaceViewRef by remember { mutableStateOf<MultiStreamGLSurfaceView?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
@@ -109,14 +115,18 @@ fun MultiStreamPlayerView(
         state.currentPage,
         state.isFullscreen,
         state.fullscreenChannelIndex,
-        state.selectedChannelIndex
+        state.selectedChannelIndex,
+        isPortrait,
+        isSmallScreen
     ) {
         MultiViewLayoutManager.calculateSlots(
             mode = state.layoutMode,
             streamCount = state.streamCount,
             pageIndex = state.currentPage,
             fullscreenChannelIndex = if (state.isFullscreen) state.fullscreenChannelIndex else -1,
-            selectedChannelIndex = state.selectedChannelIndex
+            selectedChannelIndex = state.selectedChannelIndex,
+            isPortrait = isPortrait,
+            isSmallScreen = isSmallScreen
         )
     }
 
@@ -127,14 +137,18 @@ fun MultiStreamPlayerView(
         state.currentPage,
         state.isFullscreen,
         state.fullscreenChannelIndex,
-        state.selectedChannelIndex
+        state.selectedChannelIndex,
+        isPortrait,
+        isSmallScreen
     ) {
         surfaceViewRef?.updateLayout(
             mode = state.layoutMode,
             count = state.streamCount,
             pageIndex = state.currentPage,
             fullscreenIndex = if (state.isFullscreen) state.fullscreenChannelIndex else -1,
-            selectedIndex = state.selectedChannelIndex
+            selectedIndex = state.selectedChannelIndex,
+            isPortrait = isPortrait,
+            isSmallScreen = isSmallScreen
         )
     }
 
@@ -423,6 +437,7 @@ fun MultiStreamPlayerView(
                 isFullscreen = state.isFullscreen,
                 showTooltip = state.showTooltip,
                 containerSize = containerSize,
+                isSmallScreen = isSmallScreen,
                 onChannelClick = { channelIndex ->
                     onAction(MultiViewAction.SelectChannel(channelIndex))
                 },
@@ -500,6 +515,8 @@ fun MultiStreamPlayerView(
                 channel = state.currentFullscreenChannel,
                 channelIndex = state.fullscreenChannelIndex,
                 isPtzVisible = state.isPtzControlVisible,
+                dragOffsetX = offsetX.value,
+                isSmallScreen = isSmallScreen,
                 onExitFullscreen = { onAction(MultiViewAction.ExitFullscreen) },
                 onSwitchQuality = { useMain ->
                     onAction(MultiViewAction.SwitchStreamQuality(state.fullscreenChannelIndex, useMain))

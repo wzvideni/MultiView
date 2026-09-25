@@ -39,6 +39,11 @@ interface IStreamFrameFeeder {
     fun setTestPatternEnabled(enabled: Boolean)
 
     /**
+     * 更新指定通道的视频分辨率与原始宽高比（自适应原比例居中显示）
+     */
+    fun setVideoSize(channelIndex: Int, width: Int, height: Int)
+
+    /**
      * 清空指定通道的画面（恢复为空闲等待画面）
      */
     fun clearChannel(channelIndex: Int)

@@ -415,9 +415,9 @@ object RtspLoopbackProxy {
             }
 
             // 第三阶段：虚拟头注入完成，后续码流全速透明透传
-            // 设置 12 秒流传输超时：避免网络短时抖动或摄像头 I 帧较长导致误判，同时在对方真正断开时及时释放并触发重连
+            // 设置 15 秒远端流传输超时：适配静止场景与长 I 帧间隔，并在服务端真正断开时及时释放触发重连
             try {
-                remoteSocket.soTimeout = 12000
+                remoteSocket.soTimeout = 15000
             } catch (ignored: Exception) {}
 
             val copyBuf = ByteArray(65536)

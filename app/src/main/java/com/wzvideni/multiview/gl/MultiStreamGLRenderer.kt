@@ -221,6 +221,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
     private var currentSlots: List<StreamSlotRect> = emptyList()
     private val frameQueue = ConcurrentHashMap<Int, PendingFrame>()
+    private val videoAspects = ConcurrentHashMap<Int, Float>()
 
     private class PendingFrame(
         val width: Int,
@@ -239,6 +240,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
     private val startTime = SystemClock.uptimeMillis()
 
+    @Volatile
+    private var isPortrait: Boolean = false
+
+    @Volatile
+    private var isSmallScreen: Boolean = false
+
     /**
      * 更新布局模式与流数量
      */
@@ -247,19 +254,25 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         count: Int,
         pageIndex: Int = 0,
         fullscreenIndex: Int = -1,
-        selectedIndex: Int = 0
+        selectedIndex: Int = 0,
+        isPortrait: Boolean = false,
+        isSmallScreen: Boolean = false
     ) {
         this.layoutMode = mode
         this.streamCount = count.coerceIn(0, MAX_CHANNELS)
         this.pageIndex = pageIndex
         this.fullscreenChannelIndex = fullscreenIndex
         this.selectedChannelIndex = selectedIndex
+        this.isPortrait = isPortrait
+        this.isSmallScreen = isSmallScreen
         this.currentSlots = MultiViewLayoutManager.calculateSlots(
             mode = mode,
             streamCount = streamCount,
             pageIndex = pageIndex,
             fullscreenChannelIndex = fullscreenIndex,
-            selectedChannelIndex = selectedIndex
+            selectedChannelIndex = selectedIndex,
+            isPortrait = isPortrait,
+            isSmallScreen = isSmallScreen
         )
     }
 
@@ -274,7 +287,9 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
                 streamCount = streamCount,
                 pageIndex = pageIndex,
                 fullscreenChannelIndex = fullscreenChannelIndex,
-                selectedChannelIndex = index
+                selectedChannelIndex = index,
+                isPortrait = isPortrait,
+                isSmallScreen = isSmallScreen
             )
         }
     }
@@ -354,7 +369,9 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             streamCount = streamCount,
             pageIndex = pageIndex,
             fullscreenChannelIndex = fullscreenChannelIndex,
-            selectedChannelIndex = selectedChannelIndex
+            selectedChannelIndex = selectedChannelIndex,
+            isPortrait = isPortrait,
+            isSmallScreen = isSmallScreen
         )
     }
 
@@ -448,16 +465,60 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
+    /**
+     * 计算保持原比例居中自适应 (Aspect Fit) 的实际绘制视口与裁剪区域
+     *
+     * @param glX 槽位在 OpenGL 视口中的 X 坐标 (左下角)
+     * @param glY 槽位在 OpenGL 视口中的 Y 坐标 (左下角)
+     * @param glW 槽位宽度
+     * @param glH 槽位高度
+     * @param aspectRatio 视频流原始宽高比 (width / height)
+     * @return 实际渲染视口数组 [renderX, renderY, renderW, renderH]
+     */
+    private fun calculateAspectFitViewport(
+        glX: Int,
+        glY: Int,
+        glW: Int,
+        glH: Int,
+        aspectRatio: Float
+    ): IntArray {
+        if (aspectRatio <= 0f || glW <= 0 || glH <= 0) {
+            return intArrayOf(glX, glY, glW, glH)
+        }
+        val slotRatio = glW.toFloat() / glH.toFloat()
+        return if (slotRatio > aspectRatio) {
+            // 槽位比视频更宽 -> 左右留黑边 (Pillarbox)，高度填满槽位
+            val targetW = (glH * aspectRatio).toInt().coerceAtLeast(1)
+            val offsetX = (glW - targetW) / 2
+            intArrayOf(glX + offsetX, glY, targetW, glH)
+        } else {
+            // 槽位比视频更高 -> 上下留黑边 (Letterbox)，宽度填满槽位
+            val targetH = (glW / aspectRatio).toInt().coerceAtLeast(1)
+            val offsetY = (glH - targetH) / 2
+            intArrayOf(glX, glY + offsetY, glW, targetH)
+        }
+    }
+
     private fun drawChannel(channelIndex: Int, glX: Int, glY: Int, glW: Int, glH: Int, timeSec: Float) {
         // 设置当前分屏的裁剪与视口
         GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
         GLES20.glScissor(glX, glY, glW, glH)
         GLES20.glViewport(glX, glY, glW, glH)
 
+        // 先以监控底色填充整槽，保证黑边(Letterbox/Pillarbox)区域纯净无残留
+        GLES20.glClearColor(0.043f, 0.067f, 0.078f, 1.0f) // #0B1114
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
         val isOesActive = hasOesFrame[channelIndex]
         val isRgbaActive = hasRealFrame[channelIndex]
 
         if (isOesActive) {
+            // 原比例居中自适应：计算并应用等比自适应视口
+            val aspect = videoAspects[channelIndex] ?: (16f / 9f)
+            val (vx, vy, vw, vh) = calculateAspectFitViewport(glX, glY, glW, glH, aspect)
+            GLES20.glScissor(vx, vy, vw, vh)
+            GLES20.glViewport(vx, vy, vw, vh)
+
             // 方案 A：使用 OES 外部纹理渲染硬件解码视频（ExoPlayer / MediaCodec 零拷贝）
             GLES20.glUseProgram(oesProgram)
 
@@ -478,6 +539,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             GLES20.glDisableVertexAttribArray(oesAPosition)
             GLES20.glDisableVertexAttribArray(oesATexCoord)
         } else if (isRgbaActive || !isTestPatternEnabled) {
+            // 原比例居中自适应：计算并应用等比自适应视口
+            val aspect = videoAspects[channelIndex] ?: (16f / 9f)
+            val (vx, vy, vw, vh) = calculateAspectFitViewport(glX, glY, glW, glH, aspect)
+            GLES20.glScissor(vx, vy, vw, vh)
+            GLES20.glViewport(vx, vy, vw, vh)
+
             // 方案 B：使用 2D 纹理渲染软解/投递画面
             GLES20.glUseProgram(textureProgram)
 
@@ -597,7 +664,14 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         rgbaBuffer: ByteBuffer
     ) {
         if (channelIndex in 0 until MAX_CHANNELS) {
+            setVideoSize(channelIndex, width, height)
             frameQueue[channelIndex] = PendingFrame(width, height, rgbaBuffer)
+        }
+    }
+
+    override fun setVideoSize(channelIndex: Int, width: Int, height: Int) {
+        if (channelIndex in 0 until MAX_CHANNELS && width > 0 && height > 0) {
+            videoAspects[channelIndex] = width.toFloat() / height.toFloat()
         }
     }
 
@@ -621,6 +695,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
             hasRealFrame[channelIndex] = false
             hasOesFrame[channelIndex] = false
             frameAvailableFlags[channelIndex].set(false)
+            videoAspects.remove(channelIndex)
             frameQueue.remove(channelIndex)
         }
     }
@@ -630,6 +705,7 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     }
 
     fun release() {
+        videoAspects.clear()
         if (textureProgram != 0) {
             GLES20.glDeleteProgram(textureProgram)
             textureProgram = 0

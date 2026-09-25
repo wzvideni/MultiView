@@ -1,7 +1,16 @@
 package com.wzvideni.multiview.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,30 +26,48 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.wzvideni.multiview.R
 import com.wzvideni.multiview.model.StreamChannel
+import com.wzvideni.multiview.model.StreamStatus
+import kotlinx.coroutines.delay
+import kotlin.math.abs
 
 /**
- * 单路全屏播放时的专属操作控制栏与 OSD（包括清晰度切换、云台 PTZ 控制、截屏等）
+ * 单路全屏播放专属控制层
+ *
+ * 核心优化特性：
+ * 1. 触屏唤醒 / 点击切换显隐，3秒静置自动淡出全屏控制栏；
+ * 2. 双击画面任意位置快速退出全屏；
+ * 3. 顶部提示条引导："双击窗口可退出全屏" 与快捷退出按钮；
+ * 4. 底部监控状态指示灯（在线/连接中/异常）与状态文字提示；
+ * 5. 全屏主辅码流（高清/流畅）无缝切换与云台 PTZ 控制面板；
+ * 6. 滑动手势时自动收起控制栏防遮挡。
  */
 @Composable
 fun FullscreenControls(
     channel: StreamChannel?,
     channelIndex: Int,
     isPtzVisible: Boolean,
+    dragOffsetX: Float = 0f,
+    isSmallScreen: Boolean = false,
     onExitFullscreen: () -> Unit,
     onSwitchQuality: (useMainStream: Boolean) -> Unit,
     onToggleAudio: () -> Unit,
@@ -48,90 +75,158 @@ fun FullscreenControls(
     onSnapshot: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    Box(modifier = modifier.fillMaxSize()) {
+    var isControlsVisible by remember { mutableStateOf(true) }
+    var resetTimerTrigger by remember { mutableStateOf(0) }
+
+    // 触屏唤醒后显示3秒，然后自动淡出隐藏
+    LaunchedEffect(isControlsVisible, resetTimerTrigger) {
+        if (isControlsVisible) {
+            delay(3000L)
+            isControlsVisible = false
+        }
+    }
+
+    // 通道切换后，重新显示3秒
+    LaunchedEffect(channel?.id) {
+        isControlsVisible = true
+        resetTimerTrigger++
+    }
+
+    // 左右滑动手势进行中时，收起控制栏以防遮挡
+    LaunchedEffect(dragOffsetX) {
+        if (abs(dragOffsetX) > 20f && isControlsVisible) {
+            isControlsVisible = false
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = {
+                        isControlsVisible = !isControlsVisible
+                        if (isControlsVisible) {
+                            resetTimerTrigger++
+                        }
+                    },
+                    onDoubleTap = {
+                        onExitFullscreen()
+                    }
+                )
+            }
+    ) {
         // --- 顶部控制条 ---
-        Row(
+        AnimatedVisibility(
+            visible = isControlsVisible,
+            enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
+            exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
             modifier = Modifier
-                .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .background(Color(0xCC111622))
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .fillMaxWidth()
         ) {
-            // 返回按钮
-            IconButton(
-                onClick = onExitFullscreen,
-                modifier = Modifier.size(36.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "返回分屏",
-                    tint = Color.White
-                )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            // 通道标题
-            val title = channel?.name ?: "通道 ${String.format("%02d", channelIndex + 1)}"
-            Column {
-                Text(
-                    text = title,
-                    color = Color.White,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "${if (channel?.isMainStream == true) "主码流" else "辅码流"} | ${channel?.resolution ?: "1080P"} | ${channel?.bitrateKbps ?: 1024} Kbps",
-                    color = Color(0xFF00E5FF),
-                    fontSize = 11.sp
-                )
-            }
-
-            Spacer(modifier = Modifier.weight(1f))
-
-            // 主辅码流切换按钮（全屏支持升为 1080P 主码流）
-            val isMain = channel?.isMainStream == true
-            Button(
-                onClick = { onSwitchQuality(!isMain) },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isMain) Color(0xFF00B0FF) else Color(0xFF37474F)
-                ),
-                shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+            Row(
                 modifier = Modifier
-                    .defaultMinSize(minWidth = 1.dp, minHeight = 32.dp)
-                    .height(32.dp)
+                    .fillMaxWidth()
+                    .background(Color(0xCC050C19))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        isControlsVisible = true
+                        resetTimerTrigger++
+                    }
+                    .padding(
+                        horizontal = if (isSmallScreen) 12.dp else 16.dp,
+                        vertical = if (isSmallScreen) 6.dp else 8.dp
+                    ),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = if (isMain) "高清 (主码流)" else "流畅 (辅码流)",
-                    color = Color.White,
-                    fontSize = 12.sp,
-                    maxLines = 1
+                Image(
+                    painter = painterResource(id = R.drawable.ic_tip),
+                    contentDescription = null,
+                    modifier = Modifier.size(if (isSmallScreen) 16.dp else 20.dp)
                 )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            // 云台控制显隐开关
-            Button(
-                onClick = onTogglePtz,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isPtzVisible) Color(0xFF00E676) else Color(0xFF37474F)
-                ),
-                shape = RoundedCornerShape(16.dp),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 4.dp),
-                modifier = Modifier
-                    .defaultMinSize(minWidth = 1.dp, minHeight = 32.dp)
-                    .height(32.dp)
-            ) {
+                Spacer(modifier = Modifier.width(if (isSmallScreen) 6.dp else 8.dp))
                 Text(
-                    text = "云台",
-                    color = if (isPtzVisible) Color.Black else Color.White,
-                    fontSize = 12.sp,
-                    fontWeight = if (isPtzVisible) FontWeight.Bold else FontWeight.Normal,
-                    maxLines = 1
+                    text = "双击窗口可退出全屏",
+                    color = Color(0xFF818FA0),
+                    fontSize = if (isSmallScreen) 12.sp else 14.sp,
+                    fontWeight = FontWeight.Medium
                 )
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                // 主辅码流切换按钮（全屏支持升为 1080P 主码流）
+                val isMain = channel?.isMainStream == true
+                Button(
+                    onClick = { onSwitchQuality(!isMain) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isMain) Color(0xFF02D5FE) else Color(0xFF20242E)
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                    modifier = Modifier
+                        .defaultMinSize(minWidth = 1.dp, minHeight = 28.dp)
+                        .height(28.dp)
+                ) {
+                    Text(
+                        text = if (isMain) "高清(主码流)" else "流畅(辅码流)",
+                        color = if (isMain) Color.Black else Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = if (isMain) FontWeight.Bold else FontWeight.Normal,
+                        maxLines = 1
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                // 云台控制显隐开关
+                Button(
+                    onClick = onTogglePtz,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isPtzVisible) Color(0xFF2CE898) else Color(0xFF20242E)
+                    ),
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                    modifier = Modifier
+                        .defaultMinSize(minWidth = 1.dp, minHeight = 28.dp)
+                        .height(28.dp)
+                ) {
+                    Text(
+                        text = "云台",
+                        color = if (isPtzVisible) Color.Black else Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = if (isPtzVisible) FontWeight.Bold else FontWeight.Normal,
+                        maxLines = 1
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                // 退出全屏按钮
+                Box(
+                    modifier = Modifier
+                        .size(if (isSmallScreen) 30.dp else 34.dp)
+                        .background(
+                            Color(0xCC20242E),
+                            if (isSmallScreen) CircleShape else RoundedCornerShape(6.dp)
+                        )
+                        .border(
+                            1.dp,
+                            Color(0x809DA7B2),
+                            if (isSmallScreen) CircleShape else RoundedCornerShape(6.dp)
+                        )
+                        .clickable(onClick = onExitFullscreen),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_exit_fullscreen),
+                        contentDescription = "退出全屏",
+                        tint = Color.White,
+                        modifier = Modifier.size(if (isSmallScreen) 15.dp else 18.dp)
+                    )
+                }
             }
         }
 
@@ -146,39 +241,104 @@ fun FullscreenControls(
             )
         }
 
-        // --- 底部浮动控制条 ---
-        Row(
+        // --- 底部浮动控制与状态条 ---
+        AnimatedVisibility(
+            visible = isControlsVisible,
+            enter = fadeIn() + slideInVertically(initialOffsetY = { it }),
+            exit = fadeOut() + slideOutVertically(targetOffsetY = { it }),
             modifier = Modifier
-                .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color(0xCC111622))
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceAround
+                .fillMaxWidth()
         ) {
-            ActionButton(title = "截屏", onClick = onSnapshot)
-            ActionButton(
-                title = if (channel?.isMuted == false) "静音" else "伴音",
-                onClick = onToggleAudio
-            )
-            ActionButton(title = "退出全屏", onClick = onExitFullscreen)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xB3050C19))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) {
+                        isControlsVisible = true
+                        resetTimerTrigger++
+                    }
+                    .padding(
+                        horizontal = if (isSmallScreen) 12.dp else 20.dp,
+                        vertical = if (isSmallScreen) 6.dp else 10.dp
+                    ),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val statusColor = when (channel?.status) {
+                    StreamStatus.PLAYING -> Color(0xFF2CE898)
+                    StreamStatus.CONNECTING -> Color(0xFFFFB300)
+                    StreamStatus.ERROR -> Color(0xFFE83434)
+                    else -> Color(0xFF818FA0)
+                }
+                Box(
+                    modifier = Modifier
+                        .size(if (isSmallScreen) 8.dp else 10.dp)
+                        .background(statusColor, CircleShape)
+                )
+                Spacer(modifier = Modifier.width(if (isSmallScreen) 6.dp else 8.dp))
+                Text(
+                    text = channel?.name ?: "通道 ${String.format("%02d", channelIndex + 1)}",
+                    color = Color.White,
+                    fontSize = if (isSmallScreen) 13.sp else 15.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                if (channel?.status == StreamStatus.CONNECTING) {
+                    Spacer(modifier = Modifier.width(if (isSmallScreen) 6.dp else 8.dp))
+                    Text(
+                        text = "正在连接...",
+                        color = Color(0xFFFFB300),
+                        fontSize = if (isSmallScreen) 10.sp else 12.sp
+                    )
+                } else if (channel?.status == StreamStatus.ERROR) {
+                    Spacer(modifier = Modifier.width(if (isSmallScreen) 6.dp else 8.dp))
+                    Text(
+                        text = "连接异常",
+                        color = Color(0xFFE83434),
+                        fontSize = if (isSmallScreen) 10.sp else 12.sp
+                    )
+                }
+
+                Spacer(modifier = Modifier.weight(1f))
+
+                ActionButton(
+                    title = "截屏",
+                    onClick = onSnapshot,
+                    isSmallScreen = isSmallScreen
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                ActionButton(
+                    title = if (channel?.isMuted == false) "静音" else "伴音",
+                    onClick = onToggleAudio,
+                    isSmallScreen = isSmallScreen
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun ActionButton(title: String, onClick: () -> Unit) {
+private fun ActionButton(
+    title: String,
+    onClick: () -> Unit,
+    isSmallScreen: Boolean = false
+) {
     Box(
         modifier = Modifier
-            .background(Color(0x33FFFFFF), RoundedCornerShape(16.dp))
+            .background(Color(0x33FFFFFF), RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 8.dp),
+            .padding(
+                horizontal = if (isSmallScreen) 10.dp else 14.dp,
+                vertical = if (isSmallScreen) 4.dp else 6.dp
+            ),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = title,
             color = Color.White,
-            fontSize = 13.sp,
+            fontSize = if (isSmallScreen) 11.sp else 12.sp,
             fontWeight = FontWeight.Medium,
             maxLines = 1
         )
@@ -219,9 +379,9 @@ private fun PtzControlPanel(
             Box(
                 modifier = Modifier
                     .size(36.dp)
-                .background(Color(0xFF2C384E), CircleShape)
-                .clickable { onDirectionClick("LEFT") },
-            contentAlignment = Alignment.Center
+                    .background(Color(0xFF2C384E), CircleShape)
+                    .clickable { onDirectionClick("LEFT") },
+                contentAlignment = Alignment.Center
             ) {
                 Text("◀", color = Color.White, fontSize = 14.sp)
             }
@@ -231,7 +391,7 @@ private fun PtzControlPanel(
             Box(
                 modifier = Modifier
                     .size(36.dp)
-                    .background(Color(0xFF00E5FF), CircleShape),
+                    .background(Color(0xFF02D5FE), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Text("PTZ", color = Color.Black, fontSize = 10.sp, fontWeight = FontWeight.Bold)

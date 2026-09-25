@@ -45,10 +45,12 @@ class MultiStreamGLSurfaceView @JvmOverloads constructor(
         count: Int,
         pageIndex: Int = 0,
         fullscreenIndex: Int = -1,
-        selectedIndex: Int = 0
+        selectedIndex: Int = 0,
+        isPortrait: Boolean = false,
+        isSmallScreen: Boolean = false
     ) {
         queueEvent {
-            renderer.updateLayout(mode, count, pageIndex, fullscreenIndex, selectedIndex)
+            renderer.updateLayout(mode, count, pageIndex, fullscreenIndex, selectedIndex, isPortrait, isSmallScreen)
         }
     }
 

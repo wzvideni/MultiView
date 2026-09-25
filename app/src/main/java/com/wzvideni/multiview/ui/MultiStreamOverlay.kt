@@ -70,6 +70,7 @@ fun MultiStreamOverlay(
     isFullscreen: Boolean,
     showTooltip: Boolean,
     containerSize: IntSize,
+    isSmallScreen: Boolean = false,
     onChannelClick: (channelIndex: Int) -> Unit,
     onChannelDoubleClick: (channelIndex: Int) -> Unit,
     onEmptySlotClick: () -> Unit = {},
@@ -262,25 +263,32 @@ fun MultiStreamOverlay(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .background(Color(0xCC050C19))
-                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                    .padding(
+                                        horizontal = if (isSmallScreen) 4.dp else 8.dp,
+                                        vertical = if (isSmallScreen) 2.dp else 4.dp
+                                    ),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Image(
                                     painter = painterResource(id = R.drawable.ic_tip),
                                     contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(if (isSmallScreen) 12.dp else 16.dp)
                                 )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                val tipText = if (channels.size > 1) "双击全屏 · 长按可拖动调换顺序" else "双击窗口可进行全屏"
+                                Spacer(modifier = Modifier.width(if (isSmallScreen) 4.dp else 6.dp))
+                                val tipText = if (isSmallScreen) {
+                                    if (channels.size > 1) "双击全屏·长按调换" else "双击窗口全屏"
+                                } else {
+                                    if (channels.size > 1) "双击全屏 · 长按可拖动调换顺序" else "双击窗口可进行全屏"
+                                }
                                 Text(
                                     text = tipText,
                                     color = Color(0xFF818FA0),
-                                    fontSize = 12.sp
+                                    fontSize = if (isSmallScreen) 10.sp else 12.sp
                                 )
                                 Spacer(modifier = Modifier.weight(1f))
                                 Box(
                                     modifier = Modifier
-                                        .size(24.dp)
+                                        .size(if (isSmallScreen) 20.dp else 24.dp)
                                         .background(Color(0x990B1114), RoundedCornerShape(4.dp))
                                         .border(1.dp, Color(0x809DA7B2), RoundedCornerShape(4.dp))
                                         .clickable { onCloseChannel(channel.channelIndex) },
@@ -290,7 +298,7 @@ fun MultiStreamOverlay(
                                         painter = painterResource(id = R.drawable.ic_close_channel),
                                         contentDescription = "关闭显示",
                                         tint = Color.White,
-                                        modifier = Modifier.size(12.dp)
+                                        modifier = Modifier.size(if (isSmallScreen) 10.dp else 12.dp)
                                     )
                                 }
                             }
@@ -442,9 +450,9 @@ fun MultiStreamOverlay(
                 )
             }
 
-            // B. 浮动预览卡片 (半透明卡片跟随手指移动)
-            val ghostW = 200.dp
-            val ghostH = 112.dp
+            // B. 浮动预览卡片 (半透明幽灵卡片跟随手指移动)
+            val ghostW = if (isSmallScreen) 130.dp else 200.dp
+            val ghostH = if (isSmallScreen) 74.dp else 112.dp
             val ghostWPx = with(density) { ghostW.toPx() }
             val ghostHPx = with(density) { ghostH.toPx() }
             val ghostX = (dragCurrentOffset.x - ghostWPx / 2f).coerceIn(12f, (viewW - ghostWPx - 12f).coerceAtLeast(12f))
@@ -541,7 +549,7 @@ private fun EmptySlotContent(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        val iconSize = if (widthDp < 240.dp) 48.dp else 72.dp
+        val iconSize = if (widthDp < 240.dp) 48.dp else 80.dp
         Image(
             painter = painterResource(id = R.drawable.ic_empty_screen),
             contentDescription = "暂无监控画面",
@@ -551,7 +559,7 @@ private fun EmptySlotContent(
         Text(
             text = "暂无监控画面",
             color = Color.White,
-            fontSize = if (widthDp < 240.dp) 13.sp else 15.sp,
+            fontSize = if (widthDp < 240.dp) 13.sp else 16.sp,
             fontWeight = FontWeight.Medium,
             textAlign = TextAlign.Center
         )

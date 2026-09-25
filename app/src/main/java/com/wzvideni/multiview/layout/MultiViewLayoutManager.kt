@@ -43,7 +43,9 @@ object MultiViewLayoutManager {
         streamCount: Int,
         pageIndex: Int = 0,
         fullscreenChannelIndex: Int = -1,
-        selectedChannelIndex: Int = 0
+        selectedChannelIndex: Int = 0,
+        isPortrait: Boolean = false,
+        isSmallScreen: Boolean = false
     ): List<StreamSlotRect> {
         val effectiveMode = if (mode == LayoutMode.AUTO) {
             LayoutMode.getOptimalMode(streamCount)
@@ -84,8 +86,13 @@ object MultiViewLayoutManager {
                 )
             }
             LayoutMode.GRID_2 -> {
-                val startIndex = (pageIndex * 2).coerceAtMost((streamCount - 1).coerceAtLeast(0))
-                generateGrid(rows = 1, cols = 2, streamCount = streamCount, startIndex = startIndex)
+                if (isPortrait) {
+                    val startIndex = (pageIndex * 2).coerceAtMost((streamCount - 1).coerceAtLeast(0))
+                    generateGrid(rows = 2, cols = 1, streamCount = streamCount, startIndex = startIndex)
+                } else {
+                    val startIndex = (pageIndex * 2).coerceAtMost((streamCount - 1).coerceAtLeast(0))
+                    generateGrid(rows = 1, cols = 2, streamCount = streamCount, startIndex = startIndex)
+                }
             }
             LayoutMode.GRID_4 -> {
                 val startIndex = (pageIndex * 4).coerceAtMost((streamCount - 1).coerceAtLeast(0))

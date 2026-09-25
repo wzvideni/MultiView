@@ -10,6 +10,7 @@ import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
@@ -30,14 +31,18 @@ import java.util.concurrent.ConcurrentHashMap
  * 4. 远端断开与断流自愈守护：
  *    - 监听流结束 (STATE_ENDED) 自动重连，防止对方断开后画面永久冻结；
  *    - 缓冲超时看门狗 (BUFFERING_TIMEOUT_MS)，防止流被动切断后卡死在缓冲状态；
- *    - 缓冲状态防抖 (2500ms)，避免摄像头正常 I 帧间隔导致 UI 频繁闪烁“连接中”；
  *    - 视频帧静止看门狗 (FRAME_STALL_TIMEOUT_MS)，检测无新帧输入时主动重建连接；
- * 5. 本地环回代理与 SDP 修复 (RtspLoopbackProxy)：
+ *    - 起播连接超时看门狗 (CONNECTION_TIMEOUT_MS)，防止握手静默无响应死锁；
+ * 5. 状态变动防抖与主线程重组风暴消减：
+ *    - 缓冲状态防抖 (2500ms)，避免摄像头正常 I 帧间隔导致 UI 频繁闪烁“连接中”；
+ *    - 帧解码仅在状态变动或有排队缓冲任务时通知主线程，避免 30fps*多路 造成 UI 重组风暴；
+ * 6. 本地环回代理与 SDP 修复 (RtspLoopbackProxy)：
  *    - 补齐缺失的 a=fmtp，防止 ExoPlayer 因非标 SDP 抛出异常崩溃；
  *    - OPUS 音频 Ogg 头合成注入；
- * 6. 监控专用渲染器 (RtspRenderersFactory)：
+ * 7. 监控专用渲染器 (RtspRenderersFactory)：
  *    - 静音模式下使用 NoOpAudioRenderer 解耦主时钟，杜绝 AudioTrack 欠载导致的画面顿挫；
- * 7. 零起播等待 LoadControl (bufferForPlaybackMs = 0) 与断线保留最后一帧防黑屏闪烁。
+ * 8. 零起播等待 LoadControl (bufferForPlaybackMs = 0) 与断线保留最后一帧防黑屏闪烁；
+ * 9. 原比例居中自适应 (Aspect Fit) 与解码分辨率动态通知。
  */
 @OptIn(UnstableApi::class)
 class RtspStreamPlayerManager(private val context: Context) {
@@ -49,6 +54,8 @@ class RtspStreamPlayerManager(private val context: Context) {
         private const val RTSP_TIMEOUT_MS = 12000L // RTSP 握手与媒体准备超时时间 (毫秒)
         private const val BUFFERING_TIMEOUT_MS = 10000L // 缓冲卡顿超时时间 (10秒)，给予网络抖动充足冗余
         private const val FRAME_STALL_TIMEOUT_MS = 15000L // 帧画面静止超时时间 (15秒)，适配低帧率与静态场景
+        private const val CONNECTION_TIMEOUT_MS = 15000L // 起播连接超时时间 (15秒)，防止握手静默无响应时死锁
+        private const val BUFFERING_DEBOUNCE_MS = 2500L // 缓冲防抖时间 (2.5秒)：微小网络抖动快速自愈时不闪烁 UI
         private const val WATCHDOG_INTERVAL_MS = 3000L // 看门狗巡检周期 (3秒)
 
         @Volatile
@@ -88,17 +95,20 @@ class RtspStreamPlayerManager(private val context: Context) {
     private val activeUrls = ConcurrentHashMap<Int, String>()
     private val activeMutedStates = ConcurrentHashMap<Int, Boolean>()
     private val pendingSurfaces = ConcurrentHashMap<Int, Surface>()
+    private val channelVideoSizes = ConcurrentHashMap<Int, Pair<Int, Int>>()
 
     // 重试机制与平滑启动任务管理
     private val retryCounts = ConcurrentHashMap<Int, Int>()
     private val retryTasks = ConcurrentHashMap<Int, Runnable>()
     private val pendingStartTasks = ConcurrentHashMap<Int, Runnable>()
 
-    // 缓冲超时与帧冻结看门狗
+    // 缓冲超时、帧冻结与起播连接看门狗
     private val bufferingTimeoutTasks = ConcurrentHashMap<Int, Runnable>()
     private val bufferingDebounceTasks = ConcurrentHashMap<Int, Runnable>()
+    private val connectionTimeoutTasks = ConcurrentHashMap<Int, Runnable>()
     private val stallWatchdogTasks = ConcurrentHashMap<Int, Runnable>()
     private val lastFrameTimes = ConcurrentHashMap<Int, Long>()
+    private val channelStatuses = ConcurrentHashMap<Int, StreamStatus>()
 
     private var lastChannels: List<StreamChannel>? = null
     private var lastVisibleIndices: List<Int> = emptyList()
@@ -107,11 +117,21 @@ class RtspStreamPlayerManager(private val context: Context) {
 
     var onChannelStatusChanged: ((channelIndex: Int, status: StreamStatus) -> Unit)? = null
 
+    private fun updateChannelStatus(channelIndex: Int, status: StreamStatus) {
+        val old = channelStatuses.put(channelIndex, status)
+        if (old != status) {
+            onChannelStatusChanged?.invoke(channelIndex, status)
+        }
+    }
+
     /**
      * 绑定渲染器的 FrameFeeder
      */
     fun bindFeeder(feeder: IStreamFrameFeeder) {
         this.frameFeeder = feeder
+        channelVideoSizes.forEach { (chIdx, size) ->
+            feeder.setVideoSize(chIdx, size.first, size.second)
+        }
         feeder.setOnSurfaceAvailableListener { channelIndex, surface ->
             mainHandler.post {
                 Log.d(TAG, "Channel $channelIndex surface available")
@@ -120,10 +140,28 @@ class RtspStreamPlayerManager(private val context: Context) {
             }
         }
         feeder.setOnFrameRenderedListener { channelIndex ->
-            // 收到真实解码帧，刷新时间戳并清除缓冲卡顿超时与状态抖动防抖
+            // 收到真实解码帧，记录最新帧时间戳
             lastFrameTimes[channelIndex] = SystemClock.uptimeMillis()
-            cancelBufferingTimeout(channelIndex)
-            cancelBufferingDebounce(channelIndex)
+
+            // 仅在当前非 PLAYING 状态或有正在排队的缓冲任务时投递主线程更新状态与看门狗，
+            // 避免正常播放时每秒 25~30 帧频繁投递主线程导致 UI 重组风暴
+            val currentStatus = channelStatuses[channelIndex]
+            val needsStatusUpdate = currentStatus != StreamStatus.PLAYING
+            val hasPendingBuffering = bufferingDebounceTasks.containsKey(channelIndex) ||
+                bufferingTimeoutTasks.containsKey(channelIndex) ||
+                connectionTimeoutTasks.containsKey(channelIndex)
+
+            if (needsStatusUpdate || hasPendingBuffering) {
+                mainHandler.post {
+                    if (!isChannelStillActive(channelIndex) || !activePlayers.containsKey(channelIndex)) return@post
+                    cancelBufferingDebounce(channelIndex)
+                    cancelBufferingTimeout(channelIndex)
+                    cancelConnectionTimeout(channelIndex)
+                    retryCounts.remove(channelIndex)
+                    updateChannelStatus(channelIndex, StreamStatus.PLAYING)
+                    startStallWatchdog(channelIndex)
+                }
+            }
         }
 
         // 如果之前已有流列表，立即调度
@@ -234,6 +272,23 @@ class RtspStreamPlayerManager(private val context: Context) {
         }
     }
 
+    private fun startConnectionTimeout(channelIndex: Int) {
+        cancelConnectionTimeout(channelIndex)
+        val task = Runnable {
+            connectionTimeoutTasks.remove(channelIndex)
+            if (isChannelStillActive(channelIndex) && activePlayers.containsKey(channelIndex)) {
+                Log.w(TAG, "Ch $channelIndex RTSP player connection timeout (> $CONNECTION_TIMEOUT_MS ms), triggering self-healing reconnect")
+                handleStreamFailure(channelIndex, "Connection timeout")
+            }
+        }
+        connectionTimeoutTasks[channelIndex] = task
+        mainHandler.postDelayed(task, CONNECTION_TIMEOUT_MS)
+    }
+
+    private fun cancelConnectionTimeout(channelIndex: Int) {
+        connectionTimeoutTasks.remove(channelIndex)?.let { mainHandler.removeCallbacks(it) }
+    }
+
     private fun startBufferingTimeout(channelIndex: Int) {
         cancelBufferingTimeout(channelIndex)
         val task = Runnable {
@@ -252,7 +307,7 @@ class RtspStreamPlayerManager(private val context: Context) {
     }
 
     private fun startStallWatchdog(channelIndex: Int) {
-        cancelStallWatchdog(channelIndex)
+        if (stallWatchdogTasks.containsKey(channelIndex)) return
         val watchdog = object : Runnable {
             override fun run() {
                 if (!isChannelStillActive(channelIndex) || !activePlayers.containsKey(channelIndex)) {
@@ -283,11 +338,11 @@ class RtspStreamPlayerManager(private val context: Context) {
         val task = Runnable {
             bufferingDebounceTasks.remove(channelIndex)
             if (isChannelStillActive(channelIndex) && activePlayers.containsKey(channelIndex)) {
-                onChannelStatusChanged?.invoke(channelIndex, StreamStatus.CONNECTING)
+                updateChannelStatus(channelIndex, StreamStatus.CONNECTING)
             }
         }
         bufferingDebounceTasks[channelIndex] = task
-        mainHandler.postDelayed(task, 2500L) // 2500ms 抖动防抖：应对摄像头I帧间隔(通常2秒)与短时网络抖动，避免UI频繁闪烁"连接中"
+        mainHandler.postDelayed(task, BUFFERING_DEBOUNCE_MS)
     }
 
     private fun cancelBufferingDebounce(channelIndex: Int) {
@@ -297,6 +352,7 @@ class RtspStreamPlayerManager(private val context: Context) {
     private fun cancelAllTimeouts(channelIndex: Int) {
         cancelBufferingDebounce(channelIndex)
         cancelBufferingTimeout(channelIndex)
+        cancelConnectionTimeout(channelIndex)
         cancelStallWatchdog(channelIndex)
     }
 
@@ -327,7 +383,7 @@ class RtspStreamPlayerManager(private val context: Context) {
         internalStopPlayer(channelIndex, clearFrame = false)
 
         // 3. 标记为连接中状态，通知 UI 及时展示重连中提示
-        onChannelStatusChanged?.invoke(channelIndex, StreamStatus.CONNECTING)
+        updateChannelStatus(channelIndex, StreamStatus.CONNECTING)
 
         if (url.isBlank()) {
             Log.w(TAG, "Cannot auto-retry ch $channelIndex: target RTSP URL is blank")
@@ -347,6 +403,17 @@ class RtspStreamPlayerManager(private val context: Context) {
         mainHandler.postDelayed(retryTask, delayMs)
     }
 
+    private fun notifyVideoSize(channelIndex: Int, videoSize: VideoSize) {
+        if (videoSize.width > 0 && videoSize.height > 0) {
+            val width = if (videoSize.unappliedRotationDegrees % 180 != 0) videoSize.height else videoSize.width
+            val height = if (videoSize.unappliedRotationDegrees % 180 != 0) videoSize.width else videoSize.height
+            val par = if (videoSize.pixelWidthHeightRatio > 0f) videoSize.pixelWidthHeightRatio else 1.0f
+            val adjustedWidth = (width * par).toInt().coerceAtLeast(1)
+            channelVideoSizes[channelIndex] = Pair(adjustedWidth, height)
+            frameFeeder?.setVideoSize(channelIndex, adjustedWidth, height)
+        }
+    }
+
     private fun startPlayer(channelIndex: Int, rtspUrl: String, isMuted: Boolean) {
         if (rtspUrl.isBlank()) return
 
@@ -361,8 +428,9 @@ class RtspStreamPlayerManager(private val context: Context) {
         val surface = frameFeeder?.getChannelSurface(channelIndex) ?: pendingSurfaces[channelIndex]
         Log.i(TAG, "Starting RTSP Player for ch $channelIndex -> $rtspUrl (hasSurface=${surface != null})")
 
-        // 标记为连接中
-        onChannelStatusChanged?.invoke(channelIndex, StreamStatus.CONNECTING)
+        // 标记为连接中，并启动起播连接超时看门狗 (15秒)
+        updateChannelStatus(channelIndex, StreamStatus.CONNECTING)
+        startConnectionTimeout(channelIndex)
 
         try {
             // 通过本地环回代理自动修复/补齐 SDP 中的 fmtp 配置，防止非标流导致 ExoPlayer 崩溃
@@ -399,17 +467,23 @@ class RtspStreamPlayerManager(private val context: Context) {
                         setVideoSurface(surface)
                     }
                     addListener(object : Player.Listener {
+                        override fun onVideoSizeChanged(videoSize: VideoSize) {
+                            notifyVideoSize(channelIndex, videoSize)
+                        }
+
                         override fun onPlaybackStateChanged(playbackState: Int) {
                             when (playbackState) {
                                 Player.STATE_READY -> {
+                                    notifyVideoSize(channelIndex, this@apply.videoSize)
                                     // 播放成功，清除重试计数、缓冲防抖与看门狗，记录首帧时间并启动静止看门狗
                                     Log.i(TAG, "Ch $channelIndex RTSP Stream PLAYING")
                                     retryCounts.remove(channelIndex)
                                     cancelBufferingDebounce(channelIndex)
                                     cancelBufferingTimeout(channelIndex)
+                                    cancelConnectionTimeout(channelIndex)
                                     lastFrameTimes[channelIndex] = SystemClock.uptimeMillis()
                                     startStallWatchdog(channelIndex)
-                                    onChannelStatusChanged?.invoke(channelIndex, StreamStatus.PLAYING)
+                                    updateChannelStatus(channelIndex, StreamStatus.PLAYING)
                                 }
                                 Player.STATE_BUFFERING -> {
                                     Log.d(TAG, "Ch $channelIndex RTSP Stream BUFFERING")
@@ -424,7 +498,7 @@ class RtspStreamPlayerManager(private val context: Context) {
                                 }
                                 Player.STATE_IDLE -> {
                                     Log.d(TAG, "Ch $channelIndex RTSP Stream IDLE")
-                                    onChannelStatusChanged?.invoke(channelIndex, StreamStatus.IDLE)
+                                    updateChannelStatus(channelIndex, StreamStatus.IDLE)
                                 }
                             }
                         }
@@ -442,7 +516,8 @@ class RtspStreamPlayerManager(private val context: Context) {
             activeMutedStates[channelIndex] = isMuted
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create player for ch $channelIndex: ${e.message}", e)
-            onChannelStatusChanged?.invoke(channelIndex, StreamStatus.ERROR)
+            cancelConnectionTimeout(channelIndex)
+            handleStreamFailure(channelIndex, "Player creation failed: ${e.message}")
         }
     }
 
@@ -457,14 +532,14 @@ class RtspStreamPlayerManager(private val context: Context) {
         activeUrls.remove(channelIndex)
         activeMutedStates.remove(channelIndex)
         if (clearFrame) {
+            channelVideoSizes.remove(channelIndex)
             frameFeeder?.clearChannel(channelIndex)
         }
         if (player != null) {
             try {
                 player.stop()
-                if (clearFrame) {
-                    player.clearVideoSurface()
-                }
+                // 必须无条件解绑底层 BufferQueue 生产端，防止重连时复用 Surface 发生 already connected 冲突
+                player.clearVideoSurface()
                 player.release()
             } catch (e: Exception) {
                 Log.w(TAG, "Error releasing player for ch $channelIndex: ${e.message}")
@@ -481,6 +556,7 @@ class RtspStreamPlayerManager(private val context: Context) {
         pendingStartTasks.remove(channelIndex)?.let { mainHandler.removeCallbacks(it) }
         cancelAllTimeouts(channelIndex)
         lastFrameTimes.remove(channelIndex)
+        channelStatuses.remove(channelIndex)
         internalStopPlayer(channelIndex, clearFrame = true)
     }
 
@@ -509,11 +585,18 @@ class RtspStreamPlayerManager(private val context: Context) {
         }
         bufferingDebounceTasks.clear()
 
+        for ((_, task) in connectionTimeoutTasks) {
+            mainHandler.removeCallbacks(task)
+        }
+        connectionTimeoutTasks.clear()
+
         for ((_, task) in stallWatchdogTasks) {
             mainHandler.removeCallbacks(task)
         }
         stallWatchdogTasks.clear()
         lastFrameTimes.clear()
+        channelStatuses.clear()
+        channelVideoSizes.clear()
 
         for ((idx, player) in activePlayers) {
             try {

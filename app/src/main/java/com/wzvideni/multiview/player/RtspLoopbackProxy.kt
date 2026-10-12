@@ -42,9 +42,10 @@ object RtspLoopbackProxy {
     private const val DEFAULT_H264_FMTP =
         "packetization-mode=1;profile-level-id=64002a;sprop-parameter-sets=Z2QAKqwsaoHgCJ+WbgICAoAAAfSAAHUwdDA=,aO48gA=="
 
-    // 默认兜底 H.265 VPS/SPS/PPS (1920x1080 Main Profile)
+    // 默认兜底 H.265 VPS/SPS/PPS (1920x1080 Main Profile Level 4.0)
+    // 用于应对 RTSP 服务端在 SDP 中未下发 fmtp 或缺失参数集时的 ExoPlayer 强制校验
     private const val DEFAULT_H265_FMTP =
-        "sprop-vps=QAEMAf//AWAAAAMAkAAAAAMAAAMADCAA;sprop-sps=QgEBAWAAAAMAkAAAAAMAAAMADCAPCeKAkg==;sprop-pps=RAHA8vA8kA=="
+        "sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwB4lZgJ;sprop-sps=QgEBAWAAAAMAkAAAAwAAAwB4oAPAgBDlllZpJMrwFoCAAAADAIAAAAyE;sprop-pps=RAHBcrRiQA=="
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -149,16 +150,18 @@ object RtspLoopbackProxy {
                 receiveBufferSize = 512 * 1024
                 sendBufferSize = 512 * 1024
             }
-            remote.connect(java.net.InetSocketAddress(remoteHost, remotePort), 5000)
-            remote.soTimeout = 15000
+            remote.connect(java.net.InetSocketAddress(remoteHost, remotePort), 10000)
+            remote.soTimeout = 25000
             remoteSocket = remote
             val remoteIn = remote.getInputStream()
             val remoteOut = remote.getOutputStream()
 
             val proxyBaseUrl = "rtsp://127.0.0.1:$localPort/$token"
+            val normProxyBaseUrl = proxyBaseUrl.trimEnd('/')
+            val normTargetUrl = targetUrl.trimEnd('/')
 
             // 3. 转发客户端首个请求（将代理 URL 还原为目标 URL）
-            val modifiedInitialRequest = initialRequest.replace(proxyBaseUrl, targetUrl)
+            val modifiedInitialRequest = initialRequest.replace(normProxyBaseUrl, normTargetUrl)
             remoteOut.write(modifiedInitialRequest.toByteArray(Charsets.UTF_8))
             remoteOut.flush()
 
@@ -415,9 +418,9 @@ object RtspLoopbackProxy {
             }
 
             // 第三阶段：虚拟头注入完成，后续码流全速透明透传
-            // 设置 15 秒远端流传输超时：适配静止场景与长 I 帧间隔，并在服务端真正断开时及时释放触发重连
+            // 设置 25 秒远端流传输超时：适配静止场景与长 I 帧间隔，并在服务端真正断开时及时释放触发重连
             try {
-                remoteSocket.soTimeout = 15000
+                remoteSocket.soTimeout = 25000
             } catch (ignored: Exception) {}
 
             val copyBuf = ByteArray(65536)
@@ -439,7 +442,7 @@ object RtspLoopbackProxy {
     }
 
     /**
-     * 校验并修补 SDP：如果视频轨缺少 fmtp 参数，动态补齐默认的参数集
+     * 校验并修补 SDP：如果视频轨缺少 fmtp 参数或缺少关键参数集，动态补齐默认的参数集
      */
     fun fixSdp(sdp: String, targetUrl: String, proxyBaseUrl: String): String {
         var result = sdp
@@ -447,29 +450,50 @@ object RtspLoopbackProxy {
         // 1. 替换绝对控制 URL 为本地代理基址
         result = result.replace(targetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
 
+        // 将可能存在的非标 HEVC 编码名称标准化为 ExoPlayer 支持的 H265
+        result = result.replace(Regex("""a=rtpmap:(\d+)\s+HEVC/""", RegexOption.IGNORE_CASE)) { matchResult ->
+            "a=rtpmap:${matchResult.groupValues[1]} H265/"
+        }
+
         val delimiter = if (result.contains("\r\n")) "\r\n" else "\n"
 
         // 2. 检查 H.264 视频轨 (如 a=rtpmap:100 H264/90000)
         val h264Regex = Regex("""(a=rtpmap:(\d+)\s+H264/\d+[^\r\n]*)""", RegexOption.IGNORE_CASE)
-        val h264Match = h264Regex.find(result)
-        if (h264Match != null) {
-            val pt = h264Match.groupValues[2]
-            if (!result.contains("a=fmtp:$pt")) {
+        for (match in h264Regex.findAll(result)) {
+            val pt = match.groupValues[2]
+            val fmtpRegex = Regex("""a=fmtp:$pt([ \t]+[^\r\n]*)""", RegexOption.IGNORE_CASE)
+            val fmtpMatch = fmtpRegex.find(result)
+            if (fmtpMatch == null) {
                 Log.w(TAG, "Detected H.264 video payload $pt missing a=fmtp, injecting default fmtp fallback")
                 val fmtpLine = "${delimiter}a=fmtp:$pt $DEFAULT_H264_FMTP"
-                result = result.replace(h264Match.value, h264Match.value + fmtpLine)
+                result = result.replace(match.value, match.value + fmtpLine)
+            } else if (!fmtpMatch.value.contains("sprop-parameter-sets", ignoreCase = true)) {
+                Log.w(TAG, "Detected H.264 video payload $pt missing sprop-parameter-sets in fmtp, injecting parameter sets")
+                val updatedFmtp = "${fmtpMatch.value};sprop-parameter-sets=Z2QAKqwsaoHgCJ+WbgICAoAAAfSAAHUwdDA=,aO48gA=="
+                result = result.replace(fmtpMatch.value, updatedFmtp)
             }
         }
 
         // 3. 检查 H.265 视频轨 (如 a=rtpmap:100 H265/90000)
         val h265Regex = Regex("""(a=rtpmap:(\d+)\s+H265/\d+[^\r\n]*)""", RegexOption.IGNORE_CASE)
-        val h265Match = h265Regex.find(result)
-        if (h265Match != null) {
-            val pt = h265Match.groupValues[2]
-            if (!result.contains("a=fmtp:$pt")) {
+        for (match in h265Regex.findAll(result)) {
+            val pt = match.groupValues[2]
+            val fmtpRegex = Regex("""a=fmtp:$pt([ \t]+[^\r\n]*)""", RegexOption.IGNORE_CASE)
+            val fmtpMatch = fmtpRegex.find(result)
+            if (fmtpMatch == null) {
                 Log.w(TAG, "Detected H.265 video payload $pt missing a=fmtp, injecting default fmtp fallback")
                 val fmtpLine = "${delimiter}a=fmtp:$pt $DEFAULT_H265_FMTP"
-                result = result.replace(h265Match.value, h265Match.value + fmtpLine)
+                result = result.replace(match.value, match.value + fmtpLine)
+            } else {
+                val valStr = fmtpMatch.value
+                val hasVps = valStr.contains("sprop-vps", ignoreCase = true)
+                val hasSps = valStr.contains("sprop-sps", ignoreCase = true)
+                val hasPps = valStr.contains("sprop-pps", ignoreCase = true)
+                if (!hasVps || !hasSps || !hasPps) {
+                    Log.w(TAG, "Detected H.265 video payload $pt missing VPS/SPS/PPS in fmtp, replacing with fallback fmtp")
+                    val updatedFmtp = "a=fmtp:$pt $DEFAULT_H265_FMTP"
+                    result = result.replace(fmtpMatch.value, updatedFmtp)
+                }
             }
         }
 

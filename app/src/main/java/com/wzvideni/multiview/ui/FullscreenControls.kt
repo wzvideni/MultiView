@@ -73,6 +73,7 @@ fun FullscreenControls(
     onToggleAudio: () -> Unit,
     onTogglePtz: () -> Unit,
     onSnapshot: () -> Unit = {},
+    onRetry: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var isControlsVisible by remember { mutableStateOf(true) }
@@ -116,6 +117,22 @@ fun FullscreenControls(
                 )
             }
     ) {
+        // 全屏画面处于连接异常/404错误时的居中错误反馈卡片
+        if (channel?.status == StreamStatus.ERROR) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFF0B1114)),
+                contentAlignment = Alignment.Center
+            ) {
+                StreamErrorSlotContent(
+                    widthDp = if (isSmallScreen) 320.dp else 640.dp,
+                    isSmallScreen = isSmallScreen,
+                    onRetry = onRetry
+                )
+            }
+        }
+
         // --- 顶部控制条 ---
         AnimatedVisibility(
             visible = isControlsVisible,

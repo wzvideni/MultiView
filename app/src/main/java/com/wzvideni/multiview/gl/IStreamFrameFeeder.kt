@@ -9,6 +9,11 @@ import java.nio.ByteBuffer
 interface IStreamFrameFeeder {
 
     /**
+     * 在 GL 线程重建通道 Surface，随后在主线程回调；GL 尚未就绪时等待初始化。
+     */
+    fun requestChannelSurface(channelIndex: Int, onAvailable: (Surface?) -> Unit)
+
+    /**
      * 获取指定通道绑定的硬件解码 Surface（可直接对接 ExoPlayer / MediaCodec 进行零拷贝硬件解码渲染）
      */
     fun getChannelSurface(channelIndex: Int): Surface?

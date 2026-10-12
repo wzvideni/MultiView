@@ -11,6 +11,8 @@ import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
@@ -35,7 +37,9 @@ import javax.microedition.khronos.opengles.GL10
  * 3. 保证各通道独立渲染与超低时延，同时支持未接入真实流通道的科技感模拟画面；
  * 4. 完美支持单路全屏无缝切换、空槽位剔除、多页分屏与命中测试联动。
  */
-class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
+class MultiStreamGLRenderer(
+    private val queueGlEvent: (() -> Unit) -> Unit = {}
+) : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
     companion object {
         private const val TAG = "MultiStreamGLRenderer"
@@ -194,6 +198,9 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     private val texMatrices = Array(MAX_CHANNELS) { FloatArray(16) }
     private var onSurfaceAvailableListener: ((channelIndex: Int, surface: Surface) -> Unit)? = null
     private var onFrameRenderedListener: ((channelIndex: Int) -> Unit)? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val pendingSurfaceRequests = mutableMapOf<Int, (Surface?) -> Unit>()
+    @Volatile private var released = false
 
     @Volatile
     private var surfaceWidth = 1920
@@ -300,6 +307,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     fun getCurrentSlots(): List<StreamSlotRect> = currentSlots
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        if (released) return
+        // EGL context recreation must release the previous BufferQueue consumers.
+        releaseSurfaces()
+        hasOesFrame.fill(false)
+        hasRealFrame.fill(false)
+        frameAvailableFlags.forEach { it.set(false) }
         GLES20.glClearColor(0.043f, 0.067f, 0.078f, 1.0f) // #0B1114
 
         textureProgram = GLShaderHelper.createProgram(VERTEX_SHADER_CODE, TEXTURE_FRAGMENT_SHADER_CODE)
@@ -347,17 +360,20 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
             val channelIndex = i
             val st = SurfaceTexture(oesTextureIds[i])
-            st.setOnFrameAvailableListener {
+            st.setOnFrameAvailableListener({
+                if (released || surfaceTextures[channelIndex] !== st) return@setOnFrameAvailableListener
                 frameAvailableFlags[channelIndex].set(true)
                 onFrameRenderedListener?.invoke(channelIndex)
-            }
+            }, mainHandler)
             surfaceTextures[i] = st
             val surf = Surface(st)
             surfaces[i] = surf
 
-            // 通知外部监听者（如 ExoPlayer 管理器）该通道 Surface 已可用
-            onSurfaceAvailableListener?.invoke(channelIndex, surf)
+            notifySurfaceAvailable(channelIndex, surf)
         }
+        val requests = pendingSurfaceRequests.toMap()
+        pendingSurfaceRequests.clear()
+        requests.forEach { (index, callback) -> deliverSurface(index, surfaces[index], callback) }
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -644,6 +660,72 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
 
     // --- IStreamFrameFeeder 接口实现 ---
 
+    override fun requestChannelSurface(channelIndex: Int, onAvailable: (Surface?) -> Unit) {
+        queueGlEvent {
+            if (released || channelIndex !in 0 until MAX_CHANNELS) {
+                mainHandler.post { onAvailable(null) }
+            } else if (oesTextureIds[channelIndex] == 0) {
+                pendingSurfaceRequests[channelIndex] = onAvailable
+            } else {
+                val surface = try {
+                    recreateChannelSurface(channelIndex)
+                } catch (error: Exception) {
+                    Log.e(TAG, "Cannot create Surface for ch $channelIndex: ${error.message}", error)
+                    null
+                }
+                deliverSurface(channelIndex, surface, onAvailable)
+            }
+        }
+    }
+
+    private fun deliverSurface(index: Int, surface: Surface?, callback: (Surface?) -> Unit) {
+        mainHandler.post {
+            callback(surface?.takeIf { !released && surfaces[index] === it && it.isValid })
+        }
+    }
+
+    private fun notifySurfaceAvailable(index: Int, surface: Surface) {
+        mainHandler.post {
+            if (!released && surfaces[index] === surface && surface.isValid) {
+                onSurfaceAvailableListener?.invoke(index, surface)
+            }
+        }
+    }
+
+    private fun recreateChannelSurface(channelIndex: Int): Surface? {
+        if (channelIndex !in 0 until MAX_CHANNELS) return null
+        val texId = oesTextureIds[channelIndex]
+        if (texId == 0) return surfaces[channelIndex]
+
+        val oldSurface = surfaces[channelIndex]
+        val oldSt = surfaceTextures[channelIndex]
+
+        // 若因重连或切换必须重建 SurfaceTexture，旧纹理绑定的 EGLImage 即将被销毁，
+        // 必须清空 OES 帧标记与排队标志，避免在连接过程中渲染失效/已释放的 EGLImage 造成残留画面倒置或花屏
+        hasOesFrame[channelIndex] = false
+        frameAvailableFlags[channelIndex].set(false)
+
+        try {
+            oldSurface?.release()
+            oldSt?.release()
+        } catch (ignored: Exception) {}
+
+        val newSt = SurfaceTexture(texId)
+        newSt.setOnFrameAvailableListener({
+            if (released || surfaceTextures[channelIndex] !== newSt) return@setOnFrameAvailableListener
+            frameAvailableFlags[channelIndex].set(true)
+            onFrameRenderedListener?.invoke(channelIndex)
+        }, mainHandler)
+        val newSurf = Surface(newSt)
+
+        surfaceTextures[channelIndex] = newSt
+        surfaces[channelIndex] = newSurf
+
+        notifySurfaceAvailable(channelIndex, newSurf)
+
+        return newSurf
+    }
+
     override fun getChannelSurface(channelIndex: Int): Surface? {
         return if (channelIndex in 0 until MAX_CHANNELS) surfaces[channelIndex] else null
     }
@@ -691,12 +773,14 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     }
 
     override fun clearChannel(channelIndex: Int) {
-        if (channelIndex in 0 until MAX_CHANNELS) {
-            hasRealFrame[channelIndex] = false
-            hasOesFrame[channelIndex] = false
-            frameAvailableFlags[channelIndex].set(false)
-            videoAspects.remove(channelIndex)
-            frameQueue.remove(channelIndex)
+        queueGlEvent {
+            if (channelIndex in 0 until MAX_CHANNELS) {
+                hasRealFrame[channelIndex] = false
+                hasOesFrame[channelIndex] = false
+                frameAvailableFlags[channelIndex].set(false)
+                videoAspects.remove(channelIndex)
+                frameQueue.remove(channelIndex)
+            }
         }
     }
 
@@ -705,6 +789,12 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
     }
 
     fun release() {
+        released = true
+        onSurfaceAvailableListener = null
+        onFrameRenderedListener = null
+        pendingSurfaceRequests.values.forEach { callback -> mainHandler.post { callback(null) } }
+        pendingSurfaceRequests.clear()
+        frameQueue.clear()
         videoAspects.clear()
         if (textureProgram != 0) {
             GLES20.glDeleteProgram(textureProgram)
@@ -720,10 +810,16 @@ class MultiStreamGLRenderer : GLSurfaceView.Renderer, IStreamFrameFeeder {
         }
         GLES20.glDeleteTextures(MAX_CHANNELS, textureIds, 0)
         GLES20.glDeleteTextures(MAX_CHANNELS, oesTextureIds, 0)
+        textureIds.fill(0)
+        oesTextureIds.fill(0)
+        releaseSurfaces()
+    }
 
+    private fun releaseSurfaces() {
         for (i in 0 until MAX_CHANNELS) {
             surfaces[i]?.release()
             surfaces[i] = null
+            surfaceTextures[i]?.setOnFrameAvailableListener(null)
             surfaceTextures[i]?.release()
             surfaceTextures[i] = null
         }

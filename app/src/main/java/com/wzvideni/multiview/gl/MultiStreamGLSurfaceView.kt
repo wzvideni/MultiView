@@ -15,7 +15,7 @@ class MultiStreamGLSurfaceView @JvmOverloads constructor(
     attrs: AttributeSet? = null
 ) : GLSurfaceView(context, attrs) {
 
-    val renderer = MultiStreamGLRenderer()
+    val renderer = MultiStreamGLRenderer { task -> queueEvent { task() } }
 
     init {
         setEGLContextClientVersion(2)

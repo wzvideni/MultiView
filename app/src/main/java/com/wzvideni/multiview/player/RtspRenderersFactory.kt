@@ -77,6 +77,7 @@ class NoOpAudioRenderer : BaseRenderer(C.TRACK_TYPE_AUDIO) {
 
     private val emptyBuffer = DecoderInputBuffer(DecoderInputBuffer.BUFFER_REPLACEMENT_MODE_NORMAL)
     private val formatHolder = FormatHolder()
+    private var inputEnded = false
 
     override fun getName(): String = "NoOpAudioRenderer"
 
@@ -89,13 +90,19 @@ class NoOpAudioRenderer : BaseRenderer(C.TRACK_TYPE_AUDIO) {
     }
 
     override fun render(positionUs: Long, elapsedRealtimeUs: Long) {
-        if (state != STATE_STARTED) return
+        if (state != STATE_STARTED || inputEnded) return
         try {
             // 快速读取并丢弃已就绪的音频帧，确保 SampleQueue 内存正常被回收
             while (true) {
                 emptyBuffer.clear()
                 val result = readSource(formatHolder, emptyBuffer, androidx.media3.exoplayer.source.SampleStream.FLAG_OMIT_SAMPLE_DATA)
+                if (result == C.RESULT_FORMAT_READ) continue
                 if (result != C.RESULT_BUFFER_READ) break
+                // SampleQueue keeps returning EOS; reading again would block codec release forever.
+                if (emptyBuffer.isEndOfStream) {
+                    inputEnded = true
+                    break
+                }
             }
         } catch (t: Throwable) {
             // 绝不让静音音频通道的任何异常影响主画面播放
@@ -104,5 +111,19 @@ class NoOpAudioRenderer : BaseRenderer(C.TRACK_TYPE_AUDIO) {
 
     override fun isReady(): Boolean = true
 
-    override fun isEnded(): Boolean = false
+    override fun isEnded(): Boolean = inputEnded
+
+    override fun onPositionReset(positionUs: Long, joining: Boolean) {
+        inputEnded = false
+    }
+
+    override fun onStreamChanged(
+        formats: Array<Format>,
+        startPositionUs: Long,
+        offsetUs: Long,
+        mediaPeriodId: androidx.media3.exoplayer.source.MediaSource.MediaPeriodId
+    ) {
+        super.onStreamChanged(formats, startPositionUs, offsetUs, mediaPeriodId)
+        inputEnded = false
+    }
 }

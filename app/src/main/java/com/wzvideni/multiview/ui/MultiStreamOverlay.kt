@@ -24,6 +24,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -76,6 +78,7 @@ fun MultiStreamOverlay(
     onEmptySlotClick: () -> Unit = {},
     onCloseChannel: (channelIndex: Int) -> Unit = {},
     onSwapChannels: (fromIndex: Int, toIndex: Int) -> Unit = { _, _ -> },
+    onRetryChannel: (channelIndex: Int) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val density = LocalDensity.current
@@ -250,6 +253,18 @@ fun MultiStreamOverlay(
                         }
                     } else {
                         // 视频通道内容层
+                        // 若处于连接异常/404错误，展示错误反馈与点击重试卡片
+                        if (channel.status == StreamStatus.ERROR) {
+                            val bottomBarHeight = if (heightDp < 160.dp) 22.dp else 28.dp
+                            StreamErrorSlotContent(
+                                widthDp = widthDp,
+                                heightDp = heightDp,
+                                bottomBarPadding = bottomBarHeight,
+                                isSmallScreen = isSmallScreen,
+                                onRetry = { onRetryChannel(slot.channelIndex) }
+                            )
+                        }
+
                         // A. 顶部提示条 (单击选中时显示 "双击全屏 · 长按可拖动调换顺序")
                         AnimatedVisibility(
                             visible = !isDragging && isSelected && showTooltip,
@@ -572,5 +587,125 @@ private fun EmptySlotContent(
                 textAlign = TextAlign.Center
             )
         }
+    }
+}
+
+/**
+ * 监控通道连接异常/404错误提示组件
+ * 包含：
+ * 1. 居中展示错误警示图标
+ * 2. 标题文字：“摄像头信号中断/设备未上线” (#FFFFFF)
+ * 3. 提示重试按钮：“点击重试” (#818FA0, 点击即触发重新连接拉流)
+ */
+@Composable
+fun StreamErrorSlotContent(
+    widthDp: androidx.compose.ui.unit.Dp,
+    heightDp: androidx.compose.ui.unit.Dp = androidx.compose.ui.unit.Dp.Unspecified,
+    bottomBarPadding: androidx.compose.ui.unit.Dp = 0.dp,
+    @Suppress("UNUSED_PARAMETER") isSmallScreen: Boolean = false,
+    onRetry: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val availableHeight = if (heightDp != androidx.compose.ui.unit.Dp.Unspecified) {
+        (heightDp - bottomBarPadding).coerceAtLeast(0.dp)
+    } else {
+        androidx.compose.ui.unit.Dp.Unspecified
+    }
+
+    val refDimension = if (availableHeight != androidx.compose.ui.unit.Dp.Unspecified) {
+        minOf(widthDp, availableHeight)
+    } else {
+        widthDp
+    }
+
+    val iconSize = when {
+        refDimension < 110.dp -> 36.dp
+        refDimension < 140.dp -> 44.dp
+        refDimension < 190.dp -> 52.dp
+        refDimension < 280.dp -> 64.dp
+        refDimension < 450.dp -> 80.dp
+        else -> 96.dp
+    }
+
+    val spacing = when {
+        refDimension < 140.dp -> 4.dp
+        refDimension < 190.dp -> 6.dp
+        refDimension < 280.dp -> 8.dp
+        else -> 12.dp
+    }
+
+    val titleSize = when {
+        refDimension < 140.dp -> 11.sp
+        refDimension < 190.dp -> 12.sp
+        refDimension < 280.dp -> 14.sp
+        refDimension < 450.dp -> 16.sp
+        else -> 18.sp
+    }
+
+    val subSpacing = when {
+        refDimension < 140.dp -> 3.dp
+        refDimension < 190.dp -> 4.dp
+        refDimension < 280.dp -> 6.dp
+        else -> 8.dp
+    }
+
+    val subSize = when {
+        refDimension < 140.dp -> 10.sp
+        refDimension < 190.dp -> 11.sp
+        refDimension < 280.dp -> 12.sp
+        else -> 13.sp
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B1114))
+            .padding(bottom = bottomBarPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .size(iconSize)
+                .background(Color(0x33E83434), CircleShape)
+                .border(1.dp, Color(0x66E83434), CircleShape)
+                .clickable(onClick = onRetry),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Default.Warning,
+                contentDescription = "信号中断",
+                tint = Color(0xFFE83434),
+                modifier = Modifier.size(iconSize * 0.55f)
+            )
+        }
+
+        Spacer(modifier = Modifier.height(spacing))
+
+        Text(
+            text = "摄像头信号中断/设备未上线",
+            color = Color.White,
+            fontSize = titleSize,
+            fontWeight = FontWeight.Medium,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 6.dp)
+        )
+
+        Spacer(modifier = Modifier.height(subSpacing))
+
+        Text(
+            text = "点击重试",
+            color = Color(0xFF818FA0),
+            fontSize = subSize,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .clickable(onClick = onRetry)
+                .padding(
+                    horizontal = if (refDimension < 140.dp) 8.dp else 12.dp,
+                    vertical = if (refDimension < 140.dp) 2.dp else 4.dp
+                )
+        )
     }
 }

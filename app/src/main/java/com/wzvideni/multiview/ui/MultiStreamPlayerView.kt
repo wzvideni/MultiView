@@ -57,6 +57,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import android.content.res.Configuration
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.wzvideni.multiview.gl.IStreamFrameFeeder
 import com.wzvideni.multiview.gl.MultiStreamGLSurfaceView
 import com.wzvideni.multiview.layout.MultiViewLayoutManager
@@ -97,6 +100,21 @@ fun MultiStreamPlayerView(
     val playerManager = remember { RtspStreamPlayerManager(context) }
     var surfaceViewRef by remember { mutableStateOf<MultiStreamGLSurfaceView?>(null) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, playerManager) {
+        val lifecycle = lifecycleOwner.lifecycle
+        playerManager.setPlaybackEnabled(lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> playerManager.setPlaybackEnabled(true)
+                Lifecycle.Event.ON_STOP -> playerManager.setPlaybackEnabled(false)
+                else -> Unit
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
 
     // 监听播放器状态变动并通知 ViewModel
     DisposableEffect(playerManager) {
@@ -452,6 +470,9 @@ fun MultiStreamPlayerView(
                 },
                 onSwapChannels = { from, to ->
                     onAction(MultiViewAction.SwapChannels(from, to))
+                },
+                onRetryChannel = { channelIndex ->
+                    playerManager.retryChannel(channelIndex)
                 }
             )
         }
@@ -526,6 +547,11 @@ fun MultiStreamPlayerView(
                 },
                 onTogglePtz = {
                     onAction(MultiViewAction.TogglePtzControl(!state.isPtzControlVisible))
+                },
+                onRetry = {
+                    if (state.fullscreenChannelIndex >= 0) {
+                        playerManager.retryChannel(state.fullscreenChannelIndex)
+                    }
                 }
             )
         } else if (showControls) {

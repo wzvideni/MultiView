@@ -58,6 +58,7 @@ class RtspStreamPlayerManager(private val context: Context) {
         private const val TAG = "RtspPlayerManager"
         private const val MAX_CONCURRENT_PLAYERS = 16
         private const val MAX_DECODER_FAILURES = 3
+        private const val MAX_NOT_FOUND_AUTO_RETRIES = 5
         private const val STAGGER_DELAY_MS = 250L // 错峰启动延迟步长 (毫秒)，给端侧与流媒体网关充足准备时间
         private const val RTSP_TIMEOUT_MS = 20000L // RTSP 握手与媒体准备超时时间 (20秒)
         private const val BUFFERING_TIMEOUT_MS = 15000L // 播放过程中卡顿重缓冲超时时间 (15秒)
@@ -106,10 +107,12 @@ class RtspStreamPlayerManager(private val context: Context) {
     private val decoderFailureCounts = mutableMapOf<Int, Int>()
     private val decoderStartupGuards = mutableMapOf<Int, DecoderStartupGuard>()
     private val blockedDecoderConfigs = mutableMapOf<Int, Pair<String, Boolean>>()
+    private val blockedNotFoundConfigs = mutableMapOf<Int, Pair<String, Boolean>>()
     private val channelVideoSizes = ConcurrentHashMap<Int, Pair<Int, Int>>()
 
     // 重试机制管理
     private val retryCounts = ConcurrentHashMap<Int, Int>()
+    private val notFoundRetryGuards = ConcurrentHashMap<Int, NotFoundRetryGuard>()
     private val retryTasks = ConcurrentHashMap<Int, Runnable>()
     private val pendingStartTasks = ConcurrentHashMap<Int, Runnable>()
 
@@ -133,7 +136,7 @@ class RtspStreamPlayerManager(private val context: Context) {
         if (playbackEnabled == enabled) return
         playbackEnabled = enabled
         if (!enabled) {
-            val indices = activeUrls.keys + pendingStartTasks.keys + retryTasks.keys + blockedDecoderConfigs.keys
+            val indices = activeUrls.keys + pendingStartTasks.keys + retryTasks.keys + blockedDecoderConfigs.keys + blockedNotFoundConfigs.keys
             indices.toSet().forEach { stopPlayer(it) }
         } else {
             lastChannels?.let { updateStreams(it, lastVisibleIndices, lastIsFullscreen, lastFullscreenChannelIndex) }
@@ -184,6 +187,7 @@ class RtspStreamPlayerManager(private val context: Context) {
                     cancelBufferingTimeout(channelIndex)
                     cancelConnectionTimeout(channelIndex)
                     retryCounts.remove(channelIndex)
+                    notFoundRetryGuards[channelIndex]?.reset()
                     decoderFailureCounts.remove(channelIndex)
                     decoderStartupGuards[channelIndex]?.onFirstFrame()
                     updateChannelStatus(channelIndex, StreamStatus.PLAYING)
@@ -225,7 +229,7 @@ class RtspStreamPlayerManager(private val context: Context) {
         val targetSet = targetIndices.toSet()
 
         // 1. 停止不需要的通道与未执行的任务
-        val toStop = (activePlayers.keys + pendingSurfaceStarts.keys + blockedDecoderConfigs.keys)
+        val toStop = (activePlayers.keys + pendingSurfaceStarts.keys + blockedDecoderConfigs.keys + blockedNotFoundConfigs.keys)
             .filter { it !in targetSet }
         for (idx in toStop) {
             stopPlayer(idx)
@@ -259,10 +263,17 @@ class RtspStreamPlayerManager(private val context: Context) {
             val currentMuted = activeMutedStates[idx]
             val targetConfig = url to channel.isMuted
             val blockedConfig = blockedDecoderConfigs[idx]
-            if (blockedConfig == targetConfig) continue
+            val blockedNotFoundConfig = blockedNotFoundConfigs[idx]
+            if (blockedConfig == targetConfig || blockedNotFoundConfig == targetConfig) continue
             if (blockedConfig != null) {
                 blockedDecoderConfigs.remove(idx)
                 decoderFailureCounts.remove(idx)
+            }
+            if (blockedNotFoundConfig != null) {
+                blockedNotFoundConfigs.remove(idx)
+            }
+            if (currentUrl != null && (currentUrl != url || currentMuted != channel.isMuted)) {
+                notFoundRetryGuards[idx]?.reset()
             }
             if (currentUrl == url && currentMuted == channel.isMuted &&
                 (pendingSurfaceStarts.containsKey(idx) || retryTasks.containsKey(idx))) continue
@@ -428,7 +439,12 @@ class RtspStreamPlayerManager(private val context: Context) {
         val decoderRetryBlocked = (decoderFailure && decoderAttempts >= MAX_DECODER_FAILURES) || noFrameRetryBlocked
 
         val isNotFound = reason.contains("404") || reason.contains("Not Found", ignoreCase = true)
-        val isConnectionError = isNotFound || attempt >= 2 || reason.contains("timeout", ignoreCase = true) || reason.contains("refused", ignoreCase = true)
+        val isUnauthorized = reason.contains("401") || reason.contains("Unauthorized", ignoreCase = true)
+        val isConnectionError = isNotFound || isUnauthorized || attempt >= 2 || reason.contains("timeout", ignoreCase = true) || reason.contains("refused", ignoreCase = true)
+        val notFoundRetryGuard = notFoundRetryGuards.computeIfAbsent(channelIndex) {
+            NotFoundRetryGuard(MAX_NOT_FOUND_AUTO_RETRIES)
+        }
+        val shouldRetryNotFound = notFoundRetryGuard.shouldAutoRetryAfterFailure(isNotFound)
 
         Log.w(TAG, "Ch $channelIndex RTSP stream failure [$reason] (attempt #$attempt) -> $url")
         if (startupGuard?.decoderName != null && !startupGuard.hasRenderedFirstFrame) {
@@ -466,6 +482,16 @@ class RtspStreamPlayerManager(private val context: Context) {
             return
         }
 
+        if (isNotFound && !shouldRetryNotFound) {
+            blockedNotFoundConfigs[channelIndex] = url to isMuted
+            updateChannelStatus(channelIndex, StreamStatus.ERROR)
+            Log.e(
+                TAG,
+                "Ch $channelIndex repeated RTSP 404 for ${notFoundRetryGuard.notFoundFailureCount} failures; automatic retry suspended after $MAX_NOT_FOUND_AUTO_RETRIES retries until manual retry or stream configuration changes"
+            )
+            return
+        }
+
         // 4. 重试策略：
         // 针对 404 或连接异常（设备未上线/信号中断），保持 ERROR 状态展示错误样式与“点击重试”按钮；
         // 启动后台静默重试守护（15~20秒间隔），避免频繁在 CONNECTING 和 ERROR 间闪烁；
@@ -492,8 +518,12 @@ class RtspStreamPlayerManager(private val context: Context) {
         decoderStartupGuards.remove(channelIndex)
         retryTasks.remove(channelIndex)?.let { mainHandler.removeCallbacks(it) }
         retryCounts.remove(channelIndex)
+        notFoundRetryGuards.computeIfAbsent(channelIndex) {
+            NotFoundRetryGuard(MAX_NOT_FOUND_AUTO_RETRIES)
+        }.reset()
         decoderFailureCounts.remove(channelIndex)
         blockedDecoderConfigs.remove(channelIndex)
+        blockedNotFoundConfigs.remove(channelIndex)
         cancelAllTimeouts(channelIndex)
 
         val channel = lastChannels?.getOrNull(channelIndex) ?: return
@@ -531,11 +561,12 @@ class RtspStreamPlayerManager(private val context: Context) {
         // 停止并清理该通道已有播放器（保留上一帧画面，直至新流解码出首帧后无缝替换，杜绝黑屏闪烁）
         internalStopPlayer(channelIndex, clearFrame = false)
         val feeder = frameFeeder ?: return
+        val effectiveUrl = RtspAuthHelper.formatWithDeviceAuth(rtspUrl)
         decoderStartupGuards.getOrPut(channelIndex) { DecoderStartupGuard(MAX_DECODER_FAILURES) }
-            .beginAttempt(rtspUrl, isMuted)
+            .beginAttempt(effectiveUrl, isMuted)
         val startToken = Any()
         pendingSurfaceStarts[channelIndex] = startToken
-        activeUrls[channelIndex] = rtspUrl
+        activeUrls[channelIndex] = effectiveUrl
         activeMutedStates[channelIndex] = isMuted
 
         // 标记为连接中（若后台静默重试且当前已在 ERROR 状态，则不切换，避免 UI 闪烁）
@@ -550,9 +581,9 @@ class RtspStreamPlayerManager(private val context: Context) {
                 handleStreamFailure(channelIndex, "Decoder Surface unavailable", decoderFailure = true)
                 return@requestChannelSurface
             }
-            Log.i(TAG, "Starting RTSP Player for ch $channelIndex -> $rtspUrl (surface=$surface)")
+            Log.i(TAG, "Starting RTSP Player for ch $channelIndex -> $effectiveUrl (surface=$surface)")
             startConnectionTimeout(channelIndex)
-            createPlayer(channelIndex, rtspUrl, isMuted, surface)
+            createPlayer(channelIndex, effectiveUrl, isMuted, surface)
         }
     }
 
@@ -626,6 +657,7 @@ class RtspStreamPlayerManager(private val context: Context) {
                             cancelBufferingTimeout(channelIndex)
                             cancelConnectionTimeout(channelIndex)
                             retryCounts.remove(channelIndex)
+                            notFoundRetryGuards[channelIndex]?.reset()
                             decoderFailureCounts.remove(channelIndex)
                             decoderStartupGuards[channelIndex]?.onFirstFrame()
                             Log.i(TAG, "Ch $channelIndex rendered first video frame")
@@ -644,6 +676,7 @@ class RtspStreamPlayerManager(private val context: Context) {
                                 // 杜绝“未出画面就显示已连接（绿点）”以及“无画面提前启动静止看门狗导致被误杀”的假连现象。
                                 if (lastFrameTimes.containsKey(channelIndex)) {
                                     retryCounts.remove(channelIndex)
+                                    notFoundRetryGuards[channelIndex]?.reset()
                                     cancelBufferingDebounce(channelIndex)
                                     cancelBufferingTimeout(channelIndex)
                                     cancelConnectionTimeout(channelIndex)
@@ -730,8 +763,10 @@ class RtspStreamPlayerManager(private val context: Context) {
     fun stopPlayer(channelIndex: Int) {
         retryTasks.remove(channelIndex)?.let { mainHandler.removeCallbacks(it) }
         retryCounts.remove(channelIndex)
+        notFoundRetryGuards.remove(channelIndex)
         decoderFailureCounts.remove(channelIndex)
         blockedDecoderConfigs.remove(channelIndex)
+        blockedNotFoundConfigs.remove(channelIndex)
         pendingStartTasks.remove(channelIndex)?.let { mainHandler.removeCallbacks(it) }
         cancelAllTimeouts(channelIndex)
         lastFrameTimes.remove(channelIndex)
@@ -750,6 +785,8 @@ class RtspStreamPlayerManager(private val context: Context) {
         lastFullscreenChannelIndex = -1
         pendingSurfaceStarts.clear()
         blockedDecoderConfigs.clear()
+        blockedNotFoundConfigs.clear()
+        notFoundRetryGuards.clear()
         decoderFailureCounts.clear()
         frameFeeder?.setOnSurfaceAvailableListener(null)
         frameFeeder?.setOnFrameRenderedListener(null)

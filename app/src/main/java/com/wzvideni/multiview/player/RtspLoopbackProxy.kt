@@ -24,13 +24,11 @@ import java.util.regex.Pattern
  *    抛出 IllegalArgumentException 导致应用崩溃的问题；
  * 2. 解决 Media3 RtpOpusReader 对 RTSP OPUS 音频流强依赖 Ogg 头（RFC 7845）的已知缺陷：
  *    针对标准 RTSP 服务器发送的 RFC 7587 裸 Opus 帧，在交织 TCP 通道上首帧前合成注入
- *    标准的 OpusHead 与 OpusTags RTP 包，使 Android 原生 MediaCodec Opus 解码器顺利初始化并播放声音。
- *
- * 工作机制：
- * 1. 在 127.0.0.1 本地开启随机端口监听；
- * 2. 拦截并代理客户端与真实 RTSP 服务端之间的 TCP 握手通信；
- * 3. 针对 DESCRIBE 响应中的 SDP：若发现视频轨缺少 a=fmtp，自动补充标准 H.264/H.265 fmtp 配置并修正 Content-Length；
- * 4. 针对交织二进制流：识别出首个 OPUS 音频 RTP 包时，注入 OpusHead 与 OpusTags 包，然后无缝切换为高速原始透传。
+ *    标准的 OpusHead 与 OpusTags RTP 包，使 Android 原生 MediaCodec Opus 解码器顺利初始化并播放声音；
+ * 3. 增强 RTSP 鉴权代理兼容（Transparent Auth Proxying）：
+ *    - 当远端开启 Basic/Digest 鉴权且返回 401 时，自动基于设备 ID（或 URL 中的 userInfo）透明完成认证质询并重发，
+ *      无需客户端 ExoPlayer 面对 401 质询与 Digest URI 校验失败崩溃；
+ *    - 严格遵循 RFC 2326，将 Request-URI 剥离账号密码保持为合法的规范 RTSP URI，杜绝远端 400 报错。
  */
 object RtspLoopbackProxy {
 
@@ -47,6 +45,22 @@ object RtspLoopbackProxy {
     private const val DEFAULT_H265_FMTP =
         "sprop-vps=QAEMAf//AWAAAAMAkAAAAwAAAwB4lZgJ;sprop-sps=QgEBAWAAAAMAkAAAAwAAAwB4oAPAgBDlllZpJMrwFoCAAAADAIAAAAyE;sprop-pps=RAHBcrRiQA=="
 
+    data class StreamTarget(
+        val originalUrl: String,
+        val cleanUrl: String,
+        val credentials: RtspCredentials?
+    )
+
+    class SessionAuthContext(
+        val credentials: RtspCredentials?,
+        val cleanTargetUrl: String,
+        val proxyBaseUrl: String
+    ) {
+        @Volatile var lastClientRequest: String? = null
+        @Volatile var authChallenge: String? = null
+        @Volatile var authRetried: Boolean = false
+    }
+
     @Volatile
     private var serverSocket: ServerSocket? = null
 
@@ -57,7 +71,8 @@ object RtspLoopbackProxy {
         Thread(runnable, "RtspLoopbackProxy-worker").apply { isDaemon = true }
     }
 
-    // 映射 token -> 目标原始 RTSP URL
+    // 映射 token -> 目标原始 RTSP 配置
+    private val streamTargetMap = ConcurrentHashMap<String, StreamTarget>()
     private val targetUrlMap = ConcurrentHashMap<String, String>()
 
     /**
@@ -76,8 +91,14 @@ object RtspLoopbackProxy {
         val port = localPort
         if (port <= 0) return originalUrl
 
+        val cleanUrl = RtspAuthHelper.getCleanUrl(originalUrl)
+        val credentials = RtspAuthHelper.extractCredentials(originalUrl, fallbackToDeviceId = true)
         val token = hashKey(originalUrl)
-        targetUrlMap[token] = originalUrl
+
+        val target = StreamTarget(originalUrl, cleanUrl, credentials)
+        streamTargetMap[token] = target
+        targetUrlMap[token] = cleanUrl
+
         return "rtsp://127.0.0.1:$port/$token"
     }
 
@@ -127,19 +148,21 @@ object RtspLoopbackProxy {
             val requestUriString = requestLine.split(" ").getOrNull(1) ?: ""
             val path = try {
                 URI(requestUriString).path ?: ""
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 ""
             }
 
             val token = path.trimStart('/').split('/').firstOrNull() ?: ""
-            val targetUrl = targetUrlMap[token]
-            if (targetUrl == null) {
+            val streamTarget = streamTargetMap[token]
+            val cleanTargetUrl = streamTarget?.cleanUrl ?: targetUrlMap[token]
+            if (cleanTargetUrl == null) {
                 Log.w(TAG, "No target RTSP URL mapped for token: $token")
                 clientSocket.close()
                 return
             }
 
-            val targetUri = URI(targetUrl)
+            val credentials = streamTarget?.credentials ?: RtspAuthHelper.extractCredentials(cleanTargetUrl, fallbackToDeviceId = true)
+            val targetUri = URI(cleanTargetUrl)
             val remoteHost = targetUri.host
             val remotePort = if (targetUri.port > 0) targetUri.port else DEFAULT_RTSP_PORT
 
@@ -158,39 +181,48 @@ object RtspLoopbackProxy {
 
             val proxyBaseUrl = "rtsp://127.0.0.1:$localPort/$token"
             val normProxyBaseUrl = proxyBaseUrl.trimEnd('/')
-            val normTargetUrl = targetUrl.trimEnd('/')
+            val normCleanTargetUrl = cleanTargetUrl.trimEnd('/')
 
-            // 3. 转发客户端首个请求（将代理 URL 还原为目标 URL）
-            val modifiedInitialRequest = initialRequest.replace(normProxyBaseUrl, normTargetUrl)
+            val authContext = SessionAuthContext(
+                credentials = credentials,
+                cleanTargetUrl = cleanTargetUrl,
+                proxyBaseUrl = proxyBaseUrl
+            )
+
+            // 3. 转发客户端首个请求（将代理 URL 还原为符合规范的干净目标 URL）
+            val modifiedInitialRequest = initialRequest.replace(normProxyBaseUrl, normCleanTargetUrl)
+            authContext.lastClientRequest = modifiedInitialRequest
             remoteOut.write(modifiedInitialRequest.toByteArray(Charsets.UTF_8))
             remoteOut.flush()
 
             // 4. 启动客户端 -> 远端的数据转发线程
             executor.execute {
-                forwardClientToRemote(clientIn, remoteOut, proxyBaseUrl, targetUrl, clientSocket, remote)
+                forwardClientToRemote(clientIn, remoteOut, proxyBaseUrl, cleanTargetUrl, clientSocket, remote, authContext)
             }
 
-            // 5. 在当前线程处理 远端 -> 客户端 响应（拦截并修复 DESCRIBE SDP，并注入 OPUS 虚拟头）
-            forwardRemoteToClient(remoteIn, clientOut, targetUrl, proxyBaseUrl, clientSocket, remote)
+            // 5. 在当前线程处理 远端 -> 客户端 响应（处理 401 自动鉴权、拦截并修复 DESCRIBE SDP，并注入 OPUS 虚拟头）
+            forwardRemoteToClient(remoteIn, remoteOut, clientOut, cleanTargetUrl, proxyBaseUrl, clientSocket, remote, authContext)
 
         } catch (e: Exception) {
             Log.d(TAG, "Session ended: ${e.message}")
         } finally {
-            try { clientSocket.close() } catch (ignored: Exception) {}
-            try { remoteSocket?.close() } catch (ignored: Exception) {}
+            try { clientSocket.close() } catch (_: Exception) {}
+            try { remoteSocket?.close() } catch (_: Exception) {}
         }
     }
 
     /**
-     * 转发客户端请求到远端服务器，保持将 proxyBaseUrl 替换为 targetUrl
+     * 转发客户端请求到远端服务器，保持将 proxyBaseUrl 替换为 cleanTargetUrl。
+     * 若会话已有认证挑战信息，自动为后续信令注入 Authorization 头。
      */
     private fun forwardClientToRemote(
         clientIn: InputStream,
         remoteOut: OutputStream,
         proxyBaseUrl: String,
-        targetUrl: String,
+        cleanTargetUrl: String,
         clientSocket: Socket,
-        remoteSocket: Socket
+        remoteSocket: Socket,
+        authContext: SessionAuthContext
     ) {
         val buffer = ByteArray(8192)
         try {
@@ -201,37 +233,62 @@ object RtspLoopbackProxy {
                 // 判断是否包含代理基础 URL（二进制交织包如 RTCP 直接透传，不转为字符串）
                 if (buffer[0] != '$'.code.toByte()) {
                     val text = String(buffer, 0, len, Charsets.UTF_8)
-                    if (text.contains(proxyBaseUrl)) {
-                        val replaced = text.replace(proxyBaseUrl, targetUrl)
-                        remoteOut.write(replaced.toByteArray(Charsets.UTF_8))
+                    val normProxy = proxyBaseUrl.trimEnd('/')
+                    val normCleanTarget = cleanTargetUrl.trimEnd('/')
+                    var replaced = if (text.contains(normProxy)) {
+                        text.replace(normProxy, normCleanTarget)
                     } else {
-                        remoteOut.write(buffer, 0, len)
+                        text
                     }
+
+                    // 若已认证过，且客户端请求未携带 Authorization 头，自动计算并附加对应的 Authorization 头部
+                    val challenge = authContext.authChallenge
+                    val creds = authContext.credentials
+                    if (challenge != null && creds != null && !replaced.contains("Authorization:", ignoreCase = true)) {
+                        val reqLine = RtspAuthHelper.extractRequestMethodAndUri(replaced)
+                        if (reqLine != null) {
+                            val authHeader = RtspAuthHelper.buildAuthorizationHeader(
+                                method = reqLine.first,
+                                uri = reqLine.second,
+                                credentials = creds,
+                                authenticateHeader = challenge
+                            )
+                            if (authHeader != null) {
+                                replaced = injectAuthorizationHeader(replaced, authHeader)
+                            }
+                        }
+                    }
+
+                    authContext.lastClientRequest = replaced
+                    remoteOut.write(replaced.toByteArray(Charsets.UTF_8))
                 } else {
                     remoteOut.write(buffer, 0, len)
                 }
                 remoteOut.flush()
             }
-        } catch (ignored: Exception) {
+        } catch (_: Exception) {
         } finally {
-            try { clientSocket.close() } catch (ignored: Exception) {}
-            try { remoteSocket.close() } catch (ignored: Exception) {}
+            try { clientSocket.close() } catch (_: Exception) {}
+            try { remoteSocket.close() } catch (_: Exception) {}
         }
     }
 
     /**
      * 转发远端响应到客户端：
-     * 1. 拦截并修正 DESCRIBE 的 SDP 内容（补充视频 fmtp）；
-     * 2. 识别 OPUS 音频流，并在交织 TCP 码流中首帧前注入合成的 OpusHead / OpusTags RTP 包；
-     * 3. 注入完成后无缝切换为高速流式透传。
+     * 1. 拦截 401 Unauthorized 并自动完成 Digest/Basic 鉴权重试；
+     * 2. 拦截并修正 DESCRIBE 的 SDP 内容（补充视频 fmtp）；
+     * 3. 识别 OPUS 音频流，并在交织 TCP 码流中首帧前注入合成的 OpusHead / OpusTags RTP 包；
+     * 4. 注入完成后无缝切换为高速流式透传。
      */
     private fun forwardRemoteToClient(
         remoteIn: InputStream,
+        remoteOut: OutputStream,
         clientOut: OutputStream,
-        targetUrl: String,
+        cleanTargetUrl: String,
         proxyBaseUrl: String,
         clientSocket: Socket,
-        remoteSocket: Socket
+        remoteSocket: Socket,
+        authContext: SessionAuthContext
     ) {
         val buffer = ByteArrayOutputStream()
         val readBuf = ByteArray(8192)
@@ -241,7 +298,7 @@ object RtspLoopbackProxy {
         var trailingBytes = ByteArray(0)
 
         try {
-            // 第一阶段：读取并拦截 DESCRIBE SDP 响应
+            // 第一阶段：读取并拦截 DESCRIBE SDP 响应（支持 401 自动鉴权）
             while (!clientSocket.isClosed && !remoteSocket.isClosed) {
                 val len = remoteIn.read(readBuf)
                 if (len <= 0) break
@@ -252,6 +309,54 @@ object RtspLoopbackProxy {
 
                 if (headerEndIndex > 0) {
                     val headerString = String(currentBytes, 0, headerEndIndex, Charsets.UTF_8)
+
+                    // 1. 自动检测是否需要鉴权 (401 Unauthorized)
+                    if (headerString.contains("401 Unauthorized", ignoreCase = true) && !authContext.authRetried) {
+                        val challenge = extractAuthenticateHeader(headerString)
+                        val creds = authContext.credentials
+                        val lastReq = authContext.lastClientRequest
+                        if (challenge != null && creds != null && lastReq != null) {
+                            Log.i(TAG, "RTSP 401 received, auto-authenticating for user: ${creds.username}")
+                            authContext.authRetried = true
+                            authContext.authChallenge = challenge
+
+                            val reqLine = RtspAuthHelper.extractRequestMethodAndUri(lastReq)
+                            val method = reqLine?.first ?: "DESCRIBE"
+                            val uri = reqLine?.second ?: cleanTargetUrl
+
+                            val authHeader = RtspAuthHelper.buildAuthorizationHeader(
+                                method = method,
+                                uri = uri,
+                                credentials = creds,
+                                authenticateHeader = challenge
+                            )
+
+                            if (authHeader != null) {
+                                val authenticatedRequest = injectAuthorizationHeader(lastReq, authHeader)
+                                authContext.lastClientRequest = authenticatedRequest
+
+                                // 消费掉当前 401 响应的全部字节（包含 header 以及可能的 Content-Length body）
+                                val contentLength = parseContentLength(headerString)
+                                val totalResponseLen = headerEndIndex + 4 + contentLength
+                                if (currentBytes.size >= totalResponseLen) {
+                                    val excess = currentBytes.copyOfRange(totalResponseLen, currentBytes.size)
+                                    buffer.reset()
+                                    buffer.write(excess)
+                                } else {
+                                    val remaining = totalResponseLen - currentBytes.size
+                                    skipBytes(remoteIn, remaining)
+                                    buffer.reset()
+                                }
+
+                                // 重新发送带 Authorization 的请求
+                                remoteOut.write(authenticatedRequest.toByteArray(Charsets.UTF_8))
+                                remoteOut.flush()
+
+                                // 继续循环读取下一个远端响应（通常为 200 OK + SDP）
+                                continue
+                            }
+                        }
+                    }
 
                     if (headerString.contains("application/sdp", ignoreCase = true)) {
                         // 该响应为 DESCRIBE SDP 响应
@@ -269,7 +374,7 @@ object RtspLoopbackProxy {
                             }
 
                             // 1. 修复 SDP（补充缺失的视频 a=fmtp，保留并识别音频 OPUS 轨）
-                            val fixedSdp = fixSdp(sdpString, targetUrl, proxyBaseUrl)
+                            val fixedSdp = fixSdp(sdpString, cleanTargetUrl, proxyBaseUrl)
                             val fixedSdpBytes = fixedSdp.toByteArray(Charsets.UTF_8)
 
                             // 2. 检测 SDP 中的 OPUS 音频配置
@@ -289,7 +394,7 @@ object RtspLoopbackProxy {
                                 Regex("""Content-Length:\s*\d+""", RegexOption.IGNORE_CASE),
                                 "Content-Length: ${fixedSdpBytes.size}"
                             )
-                            fixedHeader = fixedHeader.replace(targetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
+                            fixedHeader = fixedHeader.replace(cleanTargetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
 
                             // 发送修复后的 DESCRIBE 响应给客户端
                             clientOut.write(fixedHeader.toByteArray(Charsets.UTF_8))
@@ -301,7 +406,7 @@ object RtspLoopbackProxy {
                             break
                         }
                     } else {
-                        // 普通响应（如 OPTIONS 200 OK），直接转发输出
+                        // 普通响应（如 OPTIONS 200 OK，或者认证失败的 401），直接转发输出
                         clientOut.write(currentBytes)
                         clientOut.flush()
                         buffer.reset()
@@ -343,112 +448,118 @@ object RtspLoopbackProxy {
                             break
                         }
                     }
-                    val headerStr = textBaos.toString("UTF-8")
-                    val cl = parseContentLength(headerStr)
-                    if (cl > 0) {
-                        val body = ByteArray(cl)
-                        readFully(bis, body)
-                        textBaos.write(body)
-                    }
-                    clientOut.write(textBaos.toByteArray())
+
+                    val textStr = textBaos.toString(Charsets.UTF_8.name())
+                    val replacedText = textStr.replace(cleanTargetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
+                    clientOut.write(replacedText.toByteArray(Charsets.UTF_8))
                     clientOut.flush()
                 } else {
-                    // 交织二进制帧: $ <channel> <lenHi> <lenLo> <packet>
-                    val channel = bis.read()
-                    if (channel == -1) break
-                    val lenHi = bis.read()
-                    if (lenHi == -1) break
-                    val lenLo = bis.read()
-                    if (lenLo == -1) break
-                    val frameLen = (lenHi shl 8) or lenLo
-                    val packet = ByteArray(frameLen)
-                    readFully(bis, packet)
+                    // 交织二进制数据包 ($ + channel + 2-byte length + payload)
+                    val channelId = bis.read()
+                    if (channelId == -1) break
+                    val lenHigh = bis.read()
+                    if (lenHigh == -1) break
+                    val lenLow = bis.read()
+                    if (lenLow == -1) break
+                    val packetLen = ((lenHigh and 0xFF) shl 8) or (lenLow and 0xFF)
 
-                    val isRtp = frameLen >= 12 && ((packet[0].toInt() and 0xC0) == 0x80)
-                    val pt = if (isRtp) packet[1].toInt() and 0x7F else -1
+                    val packetData = ByteArray(packetLen)
+                    readFully(bis, packetData)
 
-                    if (isRtp && pt == opusPayloadType) {
-                        // 捕获到首个真实 OPUS 音频 RTP 包！
-                        val seq0 = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
-                        val tsBytes = packet.copyOfRange(4, 8)
-                        val ssrcBytes = packet.copyOfRange(8, 12)
+                    // 检查是否为 OPUS 音频 RTP 包（RTP 报头至少 12 字节，Byte 1 为 M+PT）
+                    if (packetLen >= 12 && (packetData[0].toInt() and 0xC0) == 0x80) {
+                        val pt = packetData[1].toInt() and 0x7F
+                        if (pt == opusPayloadType) {
+                            // 提取原包的序列号、时间戳、SSRC，构造虚拟头包
+                            val origSeq = ((packetData[2].toInt() and 0xFF) shl 8) or (packetData[3].toInt() and 0xFF)
+                            val tsBytes = packetData.copyOfRange(4, 8)
+                            val ssrcBytes = packetData.copyOfRange(8, 12)
 
-                        // 判断实际声道数：优先根据首帧 Opus TOC 字节的 bit 2（1=stereo, 0=mono）或者 SDP 配置
-                        val isStereo = packet.size > 12 && ((packet[12].toInt() and 0x04) != 0)
-                        val effectiveChannels = if (opusChannels == 2 || isStereo) 2 else 1
+                            Log.i(
+                                TAG,
+                                "Intercepted first OPUS RTP packet (seq=$origSeq, ch=$channelId). Injecting synthetic OpusHead & OpusTags packets..."
+                            )
 
-                        // 注入合成包 1: OpusHead RTP 包 (RFC 7845 ID Header)
-                        val headRtp = buildOpusHeadRtpPacket(pt, (seq0 - 2) and 0xFFFF, tsBytes, ssrcBytes, effectiveChannels)
-                        clientOut.write('$'.code)
-                        clientOut.write(channel)
-                        clientOut.write((headRtp.size ushr 8) and 0xFF)
-                        clientOut.write(headRtp.size and 0xFF)
-                        clientOut.write(headRtp)
+                            // 1. 注入合成的 OpusHead 包 (seq = origSeq - 2)
+                            val opusHeadSeq = (origSeq - 2 + 65536) % 65536
+                            val opusHeadRtp = buildOpusHeadRtpPacket(pt, opusHeadSeq, tsBytes, ssrcBytes, opusChannels)
+                            clientOut.write('$'.code)
+                            clientOut.write(channelId)
+                            clientOut.write((opusHeadRtp.size ushr 8) and 0xFF)
+                            clientOut.write(opusHeadRtp.size and 0xFF)
+                            clientOut.write(opusHeadRtp)
 
-                        // 注入合成包 2: OpusTags RTP 包 (RFC 7845 Comment Header)
-                        val tagsRtp = buildOpusTagsRtpPacket(pt, (seq0 - 1) and 0xFFFF, tsBytes, ssrcBytes)
-                        clientOut.write('$'.code)
-                        clientOut.write(channel)
-                        clientOut.write((tagsRtp.size ushr 8) and 0xFF)
-                        clientOut.write(tagsRtp.size and 0xFF)
-                        clientOut.write(tagsRtp)
+                            // 2. 注入合成的 OpusTags 包 (seq = origSeq - 1)
+                            val opusTagsSeq = (origSeq - 1 + 65536) % 65536
+                            val opusTagsRtp = buildOpusTagsRtpPacket(pt, opusTagsSeq, tsBytes, ssrcBytes)
+                            clientOut.write('$'.code)
+                            clientOut.write(channelId)
+                            clientOut.write((opusTagsRtp.size ushr 8) and 0xFF)
+                            clientOut.write(opusTagsRtp.size and 0xFF)
+                            clientOut.write(opusTagsRtp)
 
-                        Log.i(
-                            TAG,
-                            "Injected synthetic OpusHead and OpusTags on channel $channel (pt=$pt, seq0=$seq0, ch=$effectiveChannels)"
-                        )
-                        opusInjected = true
-                    } else {
-                        nonOpusPacketCount++
-                        if (nonOpusPacketCount > 300) {
-                            // 防御兜底：若远端持续无音频流超过 300 包，退出单帧检查模式
-                            Log.w(TAG, "No OPUS packets received after 300 frames, falling back to pass-through")
+                            // 3. 输出原始音频数据包
+                            clientOut.write('$'.code)
+                            clientOut.write(channelId)
+                            clientOut.write(lenHigh)
+                            clientOut.write(lenLow)
+                            clientOut.write(packetData)
+                            clientOut.flush()
+
                             opusInjected = true
+                            Log.i(TAG, "Synthetic Opus headers injected successfully. Switching to transparent passthrough.")
+                            break
                         }
                     }
 
-                    // 转发原始帧给客户端
+                    // 非目标 OPUS 包，原样写出
                     clientOut.write('$'.code)
-                    clientOut.write(channel)
-                    clientOut.write(lenHi)
-                    clientOut.write(lenLo)
-                    clientOut.write(packet)
+                    clientOut.write(channelId)
+                    clientOut.write(lenHigh)
+                    clientOut.write(lenLow)
+                    clientOut.write(packetData)
                     clientOut.flush()
+
+                    nonOpusPacketCount++
+                    if (nonOpusPacketCount > 100 && opusPayloadType == null) {
+                        opusInjected = true
+                        break
+                    }
                 }
             }
 
-            // 第三阶段：虚拟头注入完成，后续码流全速透明透传
-            // 设置 25 秒远端流传输超时：适配静止场景与长 I 帧间隔，并在服务端真正断开时及时释放触发重连
-            try {
-                remoteSocket.soTimeout = 25000
-            } catch (ignored: Exception) {}
-
-            val copyBuf = ByteArray(65536)
+            // 第三阶段：已完成初始化与注入，切换为全速原始字节透传
+            val passthroughBuf = ByteArray(65536)
             while (!clientSocket.isClosed && !remoteSocket.isClosed) {
-                val len = bis.read(copyBuf)
-                if (len <= 0) break
-                clientOut.write(copyBuf, 0, len)
-                // 仅在当前无更多就绪字节时才执行 flush，消除频繁 flush 带来的系统调用与 TCP 分片开销
-                if (bis.available() == 0) {
-                    clientOut.flush()
-                }
+                val r = bis.read(passthroughBuf)
+                if (r <= 0) break
+                clientOut.write(passthroughBuf, 0, r)
+                clientOut.flush()
             }
 
-        } catch (ignored: Exception) {
+        } catch (e: Exception) {
+            Log.d(TAG, "Remote to client stream closed: ${e.message}")
         } finally {
-            try { clientSocket.close() } catch (ignored: Exception) {}
-            try { remoteSocket.close() } catch (ignored: Exception) {}
+            try { clientSocket.close() } catch (_: Exception) {}
+            try { remoteSocket.close() } catch (_: Exception) {}
         }
     }
 
     /**
-     * 校验并修补 SDP：如果视频轨缺少 fmtp 参数或缺少关键参数集，动态补齐默认的参数集
+     * 修复并标准化 SDP 报文：
+     * 1. 替换绝对控制 URL 为本地代理基址；
+     * 2. 将非标 HEVC 编码名称替换为标准 H265；
+     * 3. 针对缺失 a=fmtp 或缺少参数集的 H.264/H.265 视频轨，自动注入兜底的标准 fmtp 参数集。
      */
     fun fixSdp(sdp: String, targetUrl: String, proxyBaseUrl: String): String {
         var result = sdp
+        val cleanTargetUrl = RtspAuthHelper.getCleanUrl(targetUrl)
 
         // 1. 替换绝对控制 URL 为本地代理基址
-        result = result.replace(targetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
+        result = result.replace(cleanTargetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
+        if (cleanTargetUrl != targetUrl) {
+            result = result.replace(targetUrl.trimEnd('/'), proxyBaseUrl.trimEnd('/'))
+        }
 
         // 将可能存在的非标 HEVC 编码名称标准化为 ExoPlayer 支持的 H265
         result = result.replace(Regex("""a=rtpmap:(\d+)\s+HEVC/""", RegexOption.IGNORE_CASE)) { matchResult ->
@@ -457,16 +568,17 @@ object RtspLoopbackProxy {
 
         val delimiter = if (result.contains("\r\n")) "\r\n" else "\n"
 
-        // 2. 检查 H.264 视频轨 (如 a=rtpmap:100 H264/90000)
-        val h264Regex = Regex("""(a=rtpmap:(\d+)\s+H264/\d+[^\r\n]*)""", RegexOption.IGNORE_CASE)
-        for (match in h264Regex.findAll(result)) {
-            val pt = match.groupValues[2]
+        // 检查 H.264 视频轨是否缺失 fmtp 或缺少 sprop-parameter-sets
+        val h264Regex = Regex("""a=rtpmap:(\d+)\s+H264/90000""", RegexOption.IGNORE_CASE)
+        val h264Match = h264Regex.find(result)
+        if (h264Match != null) {
+            val pt = h264Match.groupValues[1]
             val fmtpRegex = Regex("""a=fmtp:$pt([ \t]+[^\r\n]*)""", RegexOption.IGNORE_CASE)
             val fmtpMatch = fmtpRegex.find(result)
             if (fmtpMatch == null) {
                 Log.w(TAG, "Detected H.264 video payload $pt missing a=fmtp, injecting default fmtp fallback")
                 val fmtpLine = "${delimiter}a=fmtp:$pt $DEFAULT_H264_FMTP"
-                result = result.replace(match.value, match.value + fmtpLine)
+                result = result.replace(h264Match.value, h264Match.value + fmtpLine)
             } else if (!fmtpMatch.value.contains("sprop-parameter-sets", ignoreCase = true)) {
                 Log.w(TAG, "Detected H.264 video payload $pt missing sprop-parameter-sets in fmtp, injecting parameter sets")
                 val updatedFmtp = "${fmtpMatch.value};sprop-parameter-sets=Z2QAKqwsaoHgCJ+WbgICAoAAAfSAAHUwdDA=,aO48gA=="
@@ -474,16 +586,17 @@ object RtspLoopbackProxy {
             }
         }
 
-        // 3. 检查 H.265 视频轨 (如 a=rtpmap:100 H265/90000)
-        val h265Regex = Regex("""(a=rtpmap:(\d+)\s+H265/\d+[^\r\n]*)""", RegexOption.IGNORE_CASE)
-        for (match in h265Regex.findAll(result)) {
-            val pt = match.groupValues[2]
+        // 检查 H.265 视频轨是否缺失 fmtp 或缺少 sprop-vps/sprop-sps/sprop-pps
+        val h265Regex = Regex("""a=rtpmap:(\d+)\s+H265/90000""", RegexOption.IGNORE_CASE)
+        val h265Match = h265Regex.find(result)
+        if (h265Match != null) {
+            val pt = h265Match.groupValues[1]
             val fmtpRegex = Regex("""a=fmtp:$pt([ \t]+[^\r\n]*)""", RegexOption.IGNORE_CASE)
             val fmtpMatch = fmtpRegex.find(result)
             if (fmtpMatch == null) {
                 Log.w(TAG, "Detected H.265 video payload $pt missing a=fmtp, injecting default fmtp fallback")
                 val fmtpLine = "${delimiter}a=fmtp:$pt $DEFAULT_H265_FMTP"
-                result = result.replace(match.value, match.value + fmtpLine)
+                result = result.replace(h265Match.value, h265Match.value + fmtpLine)
             } else {
                 val valStr = fmtpMatch.value
                 val hasVps = valStr.contains("sprop-vps", ignoreCase = true)
@@ -498,6 +611,37 @@ object RtspLoopbackProxy {
         }
 
         return result
+    }
+
+    fun extractAuthenticateHeader(headerText: String): String? {
+        return headerText.lines().firstOrNull { line ->
+            line.startsWith("WWW-Authenticate:", ignoreCase = true)
+        }
+    }
+
+    fun injectAuthorizationHeader(request: String, authHeader: String): String {
+        val delimiter = if (request.contains("\r\n")) "\r\n" else "\n"
+        val lines = request.split(delimiter).toMutableList()
+        if (lines.isEmpty()) return request
+
+        val authIndex = lines.indexOfFirst { it.startsWith("Authorization:", ignoreCase = true) }
+        if (authIndex >= 0) {
+            lines[authIndex] = authHeader
+        } else {
+            val insertPos = if (lines.size > 1) 1 else lines.size
+            lines.add(insertPos, authHeader)
+        }
+        return lines.joinToString(delimiter)
+    }
+
+    private fun skipBytes(input: InputStream, count: Int) {
+        var remaining = count
+        val buf = ByteArray(minOf(remaining, 4096))
+        while (remaining > 0) {
+            val read = input.read(buf, 0, minOf(remaining, buf.size))
+            if (read < 0) break
+            remaining -= read
+        }
     }
 
     /**

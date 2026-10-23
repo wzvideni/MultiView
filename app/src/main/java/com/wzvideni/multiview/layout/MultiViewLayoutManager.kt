@@ -48,7 +48,15 @@ object MultiViewLayoutManager {
         isSmallScreen: Boolean = false
     ): List<StreamSlotRect> {
         val effectiveMode = if (mode == LayoutMode.AUTO) {
-            LayoutMode.getOptimalMode(streamCount)
+            if (isSmallScreen) {
+                when {
+                    streamCount <= 1 -> LayoutMode.GRID_1
+                    streamCount == 2 -> LayoutMode.GRID_2
+                    else -> LayoutMode.GRID_4
+                }
+            } else {
+                LayoutMode.getOptimalMode(streamCount)
+            }
         } else {
             mode
         }

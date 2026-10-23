@@ -60,37 +60,34 @@ authMethod: internal
 # Internal authentication.
 # Enabled users.
 authInternalUsers:
-  # Default unprivileged user.
-  # Username. 'any' means any user, including anonymous ones.
+  # 允许本机 127.0.0.1 推流与 API 管理
   - user: any
-    # Password. Not used in case of 'any' user.
     pass:
-    # IPs or networks allowed to use this user. An empty list means any IP.
-    ips: []
-    # Permissions.
+    ips: ["127.0.0.1", "::1"]
     permissions:
-      # Available actions are: publish, read, playback, api, metrics, pprof.
       - action: publish
-        # Paths can be set to further restrict access to a specific path.
-        # An empty path means any path.
-        # Regular expressions can be used by using a tilde as prefix.
         path:
+      - action: api
+      - action: metrics
+      - action: pprof
+
+  # 鉴权用户：用户名为设备ID 867400020316612，密码为空
+  - user: "867400020316612"
+    pass: ""
+    permissions:
       - action: read
         path:
       - action: playback
         path:
 
-    # Default administrator.
-    # This allows to use API, metrics and PPROF without authentication,
-    # if the IP is localhost.
-  - user: any
-    pass:
-    ips: ["127.0.0.1", "::1"]
+  # 备用测试通道：sub01，密码为空
+  - user: sub01
+    pass: ""
     permissions:
-      - action: api
-      - action: metrics
-      - action: pprof
-
+      - action: read
+        path:
+      - action: playback
+        path:
 # HTTP-based authentication.
 # URL called to perform authentication. Every time a user wants
 # to perform an action, the server calls this URL with the POST method
